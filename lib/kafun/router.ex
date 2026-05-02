@@ -6,9 +6,12 @@ defmodule Kafun.Router do
       GET    /                                     → ListAllMyBuckets
       PUT    /:bucket                              → CreateBucket
       HEAD   /:bucket                              → HeadBucket
+      DELETE /:bucket                              → DeleteBucket (404 / 409 / 204)
       POST   /:bucket?delete                       → DeleteObjects (multi-delete)
       GET    /:bucket?list-type=2&prefix=&...      → ListObjectsV2 (delimiter-aware)
       GET    /:bucket?uploads&...                  → ListMultipartUploads
+      GET    /:bucket?location|acl|versioning      → minimal stub bodies
+      GET    /:bucket?policy|cors|lifecycle|tagging → 404 NoSuch* error codes
       POST   /:bucket/<key>?uploads                → InitiateMultipartUpload
       POST   /:bucket/<key>?uploadId=…             → CompleteMultipartUpload
       PUT    /:bucket/<key>                        → PutObject (streamed)
@@ -69,6 +72,8 @@ defmodule Kafun.Router do
   end
 
   get "/:bucket" do
+    qs = conn.query_params
+
     cond do
       not Storage.valid_bucket?(bucket) ->
         error(conn, 400, "InvalidBucketName", "bucket name is not valid")
@@ -76,11 +81,15 @@ defmodule Kafun.Router do
       not Index.bucket_exists?(bucket) ->
         error(conn, 404, "NoSuchBucket", "bucket does not exist")
 
-      Map.has_key?(conn.query_params, "uploads") ->
-        list_multipart_uploads(conn, bucket)
-
-      true ->
-        list_objects(conn, bucket)
+      Map.has_key?(qs, "uploads") -> list_multipart_uploads(conn, bucket)
+      Map.has_key?(qs, "location") -> send_xml(conn, 200, S3XML.bucket_location())
+      Map.has_key?(qs, "acl") -> send_xml(conn, 200, S3XML.bucket_acl())
+      Map.has_key?(qs, "versioning") -> send_xml(conn, 200, S3XML.bucket_versioning())
+      Map.has_key?(qs, "policy") -> error(conn, 404, "NoSuchBucketPolicy", "bucket has no policy")
+      Map.has_key?(qs, "cors") -> error(conn, 404, "NoSuchCORSConfiguration", "bucket has no CORS configuration")
+      Map.has_key?(qs, "lifecycle") -> error(conn, 404, "NoSuchLifecycleConfiguration", "bucket has no lifecycle configuration")
+      Map.has_key?(qs, "tagging") -> error(conn, 404, "NoSuchTagSet", "bucket has no tag set")
+      true -> list_objects(conn, bucket)
     end
   end
 
@@ -110,6 +119,26 @@ defmodule Kafun.Router do
 
       true ->
         error(conn, 400, "InvalidRequest", "POST on a bucket requires ?delete")
+    end
+  end
+
+  delete "/:bucket" do
+    cond do
+      not Storage.valid_bucket?(bucket) ->
+        error(conn, 400, "InvalidBucketName", "bucket name is not valid")
+
+      true ->
+        case Index.delete_bucket(bucket) do
+          :ok ->
+            _ = File.rmdir(Path.join(root(), bucket))
+            send_resp(conn, 204, "")
+
+          {:error, :not_found} ->
+            error(conn, 404, "NoSuchBucket", "bucket does not exist")
+
+          {:error, :not_empty} ->
+            error(conn, 409, "BucketNotEmpty", "bucket is not empty")
+        end
     end
   end
 
@@ -213,7 +242,10 @@ defmodule Kafun.Router do
   ## Multipart handlers.
 
   defp do_initiate(conn, bucket, key) do
-    {:ok, upload_id} = Multipart.initiate(bucket, key, first_header(conn, "content-type"))
+    user_meta = collect_user_meta(conn)
+
+    {:ok, upload_id} =
+      Multipart.initiate(bucket, key, first_header(conn, "content-type"), user_meta)
 
     emit([:multipart, :initiate], %{}, %{
       bucket: bucket,
@@ -321,9 +353,24 @@ defmodule Kafun.Router do
 
   defp do_put(conn, bucket, key) do
     started = System.monotonic_time(:microsecond)
+    existing = Index.get(bucket, key)
+
+    case eval_put_preconditions(conn, existing) do
+      {:precondition, header} ->
+        error(conn, 412, "PreconditionFailed", "#{header} precondition failed")
+
+      :ok ->
+        do_put_body(conn, bucket, key, started)
+    end
+  end
+
+  defp do_put_body(conn, bucket, key, started) do
+    user_meta = collect_user_meta(conn)
     {:ok, conn, size, etag} = Storage.stream_put(conn, root(), bucket, key)
     content_type = first_header(conn, "content-type")
-    :ok = Index.put(bucket, key, size, etag, content_type, System.system_time(:second))
+
+    :ok =
+      Index.put(bucket, key, size, etag, content_type, System.system_time(:second), user_meta)
 
     emit(
       [:put, :stop],
@@ -342,9 +389,20 @@ defmodule Kafun.Router do
     with {:ok, src_bucket, src_key} <- parse_copy_source(src_header),
          true <- Storage.valid_bucket?(src_bucket) and Storage.valid_key?(src_key),
          {:ok, src_meta} <- fetch_src_meta(src_bucket, src_key),
+         :ok <- eval_copy_preconditions(conn, src_meta),
          {:ok, _size} <- Storage.copy_blob(root(), src_bucket, src_key, dst_bucket, dst_key) do
       now = System.system_time(:second)
-      :ok = Index.put(dst_bucket, dst_key, src_meta.size, src_meta.etag, src_meta.content_type, now)
+
+      :ok =
+        Index.put(
+          dst_bucket,
+          dst_key,
+          src_meta.size,
+          src_meta.etag,
+          src_meta.content_type,
+          now,
+          Map.get(src_meta, :meta, %{})
+        )
 
       emit(
         [:copy, :stop],
@@ -358,6 +416,7 @@ defmodule Kafun.Router do
       {:error, :invalid_copy_source} -> error(conn, 400, "InvalidArgument", "x-amz-copy-source malformed")
       {:error, :no_such_key} -> error(conn, 404, "NoSuchKey", "source object does not exist")
       {:error, :not_found} -> error(conn, 404, "NoSuchKey", "source object missing on disk")
+      {:precondition, header} -> error(conn, 412, "PreconditionFailed", "#{header} precondition failed")
     end
   end
 
@@ -445,41 +504,54 @@ defmodule Kafun.Router do
         error(conn, 404, "NoSuchKey", key)
 
       {:ok, meta} ->
-        path = Storage.blob_path(root(), bucket, key)
-        range_header = first_header(conn, "range")
-
-        case Storage.parse_range(range_header, meta.size) do
-          :none ->
-            emit(
-              [:get, :stop],
-              %{size: meta.size, duration: System.monotonic_time(:microsecond) - started},
-              %{bucket: bucket, key: key, range: false}
-            )
-
+        case eval_get_preconditions(conn, meta) do
+          :not_modified ->
             conn
-            |> put_meta_headers(meta)
-            |> Plug.Conn.send_file(200, path)
+            |> put_resp_header("etag", ~s|"#{meta.etag}"|)
+            |> put_resp_header("last-modified", http_date(meta.mtime))
+            |> send_resp(304, "")
 
-          {:ok, start, stop} ->
-            length = stop - start + 1
+          {:precondition, header} ->
+            error(conn, 412, "PreconditionFailed", "#{header} precondition failed")
 
-            emit(
-              [:get, :stop],
-              %{size: length, duration: System.monotonic_time(:microsecond) - started},
-              %{bucket: bucket, key: key, range: true}
-            )
-
-            conn
-            |> put_meta_headers(meta)
-            |> put_resp_header(
-              "content-range",
-              "bytes #{start}-#{stop}/#{meta.size}"
-            )
-            |> Plug.Conn.send_file(206, path, start, length)
-
-          :invalid ->
-            error(conn, 416, "InvalidRange", "bad Range header")
+          :ok ->
+            serve_object(conn, bucket, key, meta, started)
         end
+    end
+  end
+
+  defp serve_object(conn, bucket, key, meta, started) do
+    path = Storage.blob_path(root(), bucket, key)
+    range_header = first_header(conn, "range")
+
+    case Storage.parse_range(range_header, meta.size) do
+      :none ->
+        emit(
+          [:get, :stop],
+          %{size: meta.size, duration: System.monotonic_time(:microsecond) - started},
+          %{bucket: bucket, key: key, range: false}
+        )
+
+        conn
+        |> put_meta_headers(meta)
+        |> Plug.Conn.send_file(200, path)
+
+      {:ok, start, stop} ->
+        length = stop - start + 1
+
+        emit(
+          [:get, :stop],
+          %{size: length, duration: System.monotonic_time(:microsecond) - started},
+          %{bucket: bucket, key: key, range: true}
+        )
+
+        conn
+        |> put_meta_headers(meta)
+        |> put_resp_header("content-range", "bytes #{start}-#{stop}/#{meta.size}")
+        |> Plug.Conn.send_file(206, path, start, length)
+
+      :invalid ->
+        error(conn, 416, "InvalidRange", "bad Range header")
     end
   end
 
@@ -489,9 +561,21 @@ defmodule Kafun.Router do
         error(conn, 404, "NoSuchKey", key)
 
       {:ok, meta} ->
-        conn
-        |> put_meta_headers(meta)
-        |> send_resp(200, "")
+        case eval_get_preconditions(conn, meta) do
+          :not_modified ->
+            conn
+            |> put_resp_header("etag", ~s|"#{meta.etag}"|)
+            |> put_resp_header("last-modified", http_date(meta.mtime))
+            |> send_resp(304, "")
+
+          {:precondition, header} ->
+            error(conn, 412, "PreconditionFailed", "#{header} precondition failed")
+
+          :ok ->
+            conn
+            |> put_meta_headers(meta)
+            |> send_resp(200, "")
+        end
     end
   end
 
@@ -704,6 +788,7 @@ defmodule Kafun.Router do
       |> put_resp_header("content-length", Integer.to_string(meta.size))
       |> put_resp_header("last-modified", http_date(meta.mtime))
       |> put_resp_header("accept-ranges", "bytes")
+      |> put_user_meta(Map.get(meta, :meta, %{}))
 
     case meta.content_type do
       nil -> conn
@@ -711,10 +796,149 @@ defmodule Kafun.Router do
     end
   end
 
+  defp put_user_meta(conn, %{} = meta) when map_size(meta) == 0, do: conn
+
+  defp put_user_meta(conn, %{} = meta) do
+    Enum.reduce(meta, conn, fn {k, v}, acc ->
+      put_resp_header(acc, "x-amz-meta-" <> to_string(k), to_string(v))
+    end)
+  end
+
+  defp collect_user_meta(conn) do
+    Enum.reduce(conn.req_headers, %{}, fn {k, v}, acc ->
+      case k do
+        "x-amz-meta-" <> name when name != "" -> Map.put(acc, name, v)
+        _ -> acc
+      end
+    end)
+  end
+
   defp http_date(unix_seconds) do
     unix_seconds
     |> DateTime.from_unix!()
     |> Calendar.strftime("%a, %d %b %Y %H:%M:%S GMT")
+  end
+
+  ## Conditional request preconditions (RFC 7232 + S3 extensions).
+
+  @months %{
+    "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4,
+    "May" => 5, "Jun" => 6, "Jul" => 7, "Aug" => 8,
+    "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12
+  }
+
+  # Only RFC 1123 form ("Sat, 02 May 2026 06:01:23 GMT") — what every modern
+  # client emits. Returns `:invalid` on anything else; callers treat invalid
+  # as "no precondition" (lenient, same as S3).
+  defp parse_http_date(nil), do: :none
+
+  defp parse_http_date(s) when is_binary(s) do
+    case Regex.run(~r/^\w{3}, (\d{2}) (\w{3}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/, s) do
+      [_, d, mon, y, h, mi, sec] ->
+        with {:ok, m} <- Map.fetch(@months, mon),
+             {:ok, date} <- Date.new(String.to_integer(y), m, String.to_integer(d)),
+             {:ok, time} <- Time.new(String.to_integer(h), String.to_integer(mi), String.to_integer(sec)),
+             {:ok, dt} <- DateTime.new(date, time, "Etc/UTC") do
+          {:ok, DateTime.to_unix(dt)}
+        else
+          _ -> :invalid
+        end
+
+      _ ->
+        :invalid
+    end
+  end
+
+  defp parse_etag_list(raw) do
+    raw
+    |> String.split(",")
+    |> Enum.map(fn t -> t |> String.trim() |> String.trim(~s|"|) end)
+  end
+
+  defp etag_in?(meta, raw) do
+    etags = parse_etag_list(raw)
+    Enum.member?(etags, meta.etag) or Enum.member?(etags, "*")
+  end
+
+  # Returns `:ok`, `:not_modified`, or `{:precondition, header_name}`.
+  # Per RFC 7232 ordering: If-Match overrides If-Unmodified-Since, and
+  # If-None-Match overrides If-Modified-Since.
+  defp eval_get_preconditions(conn, meta) do
+    if_match = first_header(conn, "if-match")
+    if_none = first_header(conn, "if-none-match")
+    if_unmod = first_header(conn, "if-unmodified-since")
+    if_mod = first_header(conn, "if-modified-since")
+
+    cond do
+      if_match && not etag_in?(meta, if_match) ->
+        {:precondition, "If-Match"}
+
+      is_nil(if_match) && match?({:ok, _}, parse_http_date(if_unmod)) &&
+          (with {:ok, t} <- parse_http_date(if_unmod), do: meta.mtime > t) ->
+        {:precondition, "If-Unmodified-Since"}
+
+      if_none && etag_in?(meta, if_none) ->
+        :not_modified
+
+      is_nil(if_none) && match?({:ok, _}, parse_http_date(if_mod)) &&
+          (with {:ok, t} <- parse_http_date(if_mod), do: meta.mtime <= t) ->
+        :not_modified
+
+      true ->
+        :ok
+    end
+  end
+
+  # PUT / CreateObject preconditions. `existing` is the current Index.get
+  # result (`{:ok, meta}` or `:not_found`).
+  defp eval_put_preconditions(conn, existing) do
+    if_match = first_header(conn, "if-match")
+    if_none = first_header(conn, "if-none-match")
+
+    cond do
+      if_none == "*" and match?({:ok, _}, existing) ->
+        {:precondition, "If-None-Match"}
+
+      if_match == "*" and existing == :not_found ->
+        {:precondition, "If-Match"}
+
+      if_match && match?({:ok, _}, existing) && not etag_in?(elem(existing, 1), if_match) ->
+        {:precondition, "If-Match"}
+
+      if_none && match?({:ok, _}, existing) && etag_in?(elem(existing, 1), if_none) ->
+        {:precondition, "If-None-Match"}
+
+      true ->
+        :ok
+    end
+  end
+
+  # CopyObject preconditions evaluate the source object's metadata against
+  # the `x-amz-copy-source-if-*` headers. Same precedence as GET.
+  defp eval_copy_preconditions(conn, src_meta) do
+    if_match = first_header(conn, "x-amz-copy-source-if-match")
+    if_none = first_header(conn, "x-amz-copy-source-if-none-match")
+    if_unmod = first_header(conn, "x-amz-copy-source-if-unmodified-since")
+    if_mod = first_header(conn, "x-amz-copy-source-if-modified-since")
+
+    cond do
+      if_match && not etag_in?(src_meta, if_match) ->
+        {:precondition, "x-amz-copy-source-if-match"}
+
+      is_nil(if_match) && match?({:ok, _}, parse_http_date(if_unmod)) &&
+          (with {:ok, t} <- parse_http_date(if_unmod), do: src_meta.mtime > t) ->
+        {:precondition, "x-amz-copy-source-if-unmodified-since"}
+
+      if_none && etag_in?(src_meta, if_none) ->
+        {:precondition, "x-amz-copy-source-if-none-match"}
+
+      is_nil(if_none) && match?({:ok, _}, parse_http_date(if_mod)) &&
+          (with {:ok, t} <- parse_http_date(if_mod), do: src_meta.mtime <= t) ->
+        {:precondition, "x-amz-copy-source-if-modified-since"}
+
+      true ->
+        :ok
+    end
   end
 
   defp send_xml(conn, status, iolist) do

@@ -59,11 +59,17 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 **Multi-Object Delete.** `POST /:bucket?delete` with a `<Delete><Object><Key>…</Key></Object>…[<Quiet>true</Quiet>]</Delete>` body (Saxy parsed via `S3XML.parse_delete_body/1`). Up to 1000 keys per request; body capped at 1 MiB. Each key is run through `Storage.valid_key?/1` and reported as either `<Deleted>` (always idempotent — deleting a non-existent key is a no-op success) or `<Error Code="InvalidKey">`. Quiet mode suppresses `<Deleted>` blocks but always emits `<Error>`. Status is always 200 even on per-key errors; clients dispatch on the response body. Telemetry: `[:kafun, :delete_objects, :stop]` with `:count`, `:deleted`, `:errors`, `:duration`.
 
-**Bucket existence gating.** `Index.bucket_exists?/1` is a prepared `SELECT 1 FROM buckets WHERE name = ? LIMIT 1` and runs in `with_object/4`, the bucket-level `GET`, the bucket-level `POST ?delete`, and `HEAD /:bucket`. Operations against a never-created bucket return `404 NoSuchBucket` instead of silently empty results or auto-creating. CreateBucket (`PUT /:bucket`) is the only path that still calls `Index.ensure_bucket/1`. Note: `Index.put/6` *also* still calls `ensure_bucket_inline` — that's intentional so direct API callers in tests work, but the router always passes through the existence guard before reaching it.
+**Bucket existence gating.** `Index.bucket_exists?/1` is a prepared `SELECT 1 FROM buckets WHERE name = ? LIMIT 1` and runs in `with_object/4`, the bucket-level `GET`, the bucket-level `POST ?delete`, and `HEAD /:bucket`. Operations against a never-created bucket return `404 NoSuchBucket` instead of silently empty results or auto-creating. CreateBucket (`PUT /:bucket`) is the only path that still calls `Index.ensure_bucket/1`. Note: `Index.put/7` *also* still calls `ensure_bucket_inline` — that's intentional so direct API callers in tests work, but the router always passes through the existence guard before reaching it. **DeleteBucket** (`DELETE /:bucket`) is gated by `Index.delete_bucket/1`, which checks `bucket_has_objects` (a separate prepared statement) before issuing the row delete and returns `:not_empty` for the `BucketNotEmpty` 409. The router additionally calls `File.rmdir/1` on the bucket subdir after a successful index delete — we let it fail silently because in some test scenarios the dir was never created.
+
+**Bucket sub-resources.** `GET /:bucket?location|acl|versioning` return minimal stubs (`us-east-1`, single FULL_CONTROL grant to a fixed `kafun` owner, empty versioning config). `?policy|cors|lifecycle|tagging` return their proper `NoSuchBucketPolicy`/`NoSuchCORSConfiguration`/`NoSuchLifecycleConfiguration`/`NoSuchTagSet` 404 error codes — boto3 expects these specific codes and silently treats them as "feature not configured." Without these branches, ListObjectsV2 would fire instead and clients would get a list of objects when they asked for a config document.
 
 **Request id.** `:stamp_request` plug is the second plug in the pipeline (right after `Plug.Logger`). Each request gets a `:crypto.strong_rand_bytes(8)` upper-hex id assigned to `conn.assigns[:request_id]` and emitted as `x-amz-request-id` on every response. The same id is carried into `<RequestId>` and `<HostId>` of error XML bodies (we don't differentiate the two; real S3 has two distinct values for AWS-internal tracing, irrelevant here). The `error/4` helper detects `conn.method == "HEAD"` and emits empty body + `x-amz-error-code: <Code>` header instead of the XML body — HEAD has no body to carry the code, so the header is the only signal.
 
-**Index concurrency.** One GenServer owns the SQLite handle and serializes both reads and writes. WAL is on, but we don't exploit it — every call queues. For homelab volumes this is fine; if it becomes a bottleneck, the upgrade path is a `NimblePool` of read connections (writes still through the GenServer to keep `INSERT OR REPLACE` race-free). Two indexes were added beyond the implicit PKs: `uploads(bucket, key, upload_id)` for ListMultipartUploads and `uploads(initiated_at)` for the GC abandoned-upload query. The `parts.mtime` column is added via an idempotent `ALTER TABLE` migration in `Index.init/1`.
+**Index concurrency.** One GenServer owns the SQLite handle and serializes both reads and writes. WAL is on, but we don't exploit it — every call queues. For homelab volumes this is fine; if it becomes a bottleneck, the upgrade path is a `NimblePool` of read connections (writes still through the GenServer to keep `INSERT OR REPLACE` race-free). Two indexes were added beyond the implicit PKs: `uploads(bucket, key, upload_id)` for ListMultipartUploads and `uploads(initiated_at)` for the GC abandoned-upload query. Three idempotent `ALTER TABLE` migrations run in `Index.init/1` for legacy DBs: `parts.mtime`, `objects.meta`, `uploads.meta`.
+
+**User metadata.** `x-amz-meta-*` headers on PUT, CopyObject, and InitiateMultipartUpload are collected into a `%{name => value}` map by `Router.collect_user_meta/1`, JSON-encoded via OTP 27's built-in `:json` module, and stored in `objects.meta` (or `uploads.meta` until Complete promotes it). On GET/HEAD, `Router.put_user_meta/2` walks the decoded map and emits each entry as `x-amz-meta-<name>: <value>`. CopyObject in default COPY mode carries source metadata to the destination (the only directive we honour today; REPLACE is a Tier-2 follow-up). Multipart uploads stash meta at Initiate, read it from the `uploads` row at Complete, and pass it to `Index.put`.
+
+**Conditional requests.** `eval_get_preconditions/2`, `eval_put_preconditions/2`, and `eval_copy_preconditions/2` implement RFC 7232 ordering: If-Match overrides If-Unmodified-Since; If-None-Match overrides If-Modified-Since. Etag comparison strips quotes and accepts `*` as a wildcard. PUT honours `If-Match: *` (must exist) and `If-None-Match: *` (must not exist) for atomic write-once semantics. CopyObject reads the same four headers in the `x-amz-copy-source-if-*` namespace against the source's metadata. Date parsing handles RFC 1123 only (`"Sat, 02 May 2026 06:01:23 GMT"`); other forms are treated as missing — same lenience as S3. Failures return either 304 NotModified (safe-method conditional miss) or 412 PreconditionFailed.
 
 **GC.** `Kafun.GC` is a tick-based GenServer in the supervision tree. Each tick runs three passes:
 1. **Abandoned uploads** — `uploads` rows older than `:abandon_after`, aborted via `Multipart.abort/2`.
@@ -82,21 +88,17 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 ## What's left for S3 parity
 
-Done so far: ListAllMyBuckets, CreateBucket, HeadBucket, ListObjectsV2 (delimiter / pagination / encoding-type / fetch-owner), PutObject, GetObject (with Range), HeadObject, DeleteObject, multipart Initiate/UploadPart/Complete/Abort/ListMultipartUploads/ListParts, CopyObject, UploadPartCopy, DeleteObjects (multi-delete), aws-chunked unwrap, NoSuchBucket gating, x-amz-request-id + error RequestId/HostId, x-amz-error-code on HEAD 404. End-to-end verified against real boto3 (990-image migration) and via curl wire tests.
-
-### Tier 1 — gaps that block daily aws-cli flow
-
-- **DeleteBucket** (`DELETE /:bucket`). Required for `aws s3 rb`. Implementation is one prepared statement (`DELETE FROM buckets WHERE name = ?`), an `rmdir` of the bucket dir on disk if empty, and per-spec a `BucketNotEmpty` error when `objects` still has rows. `--force` is implemented client-side (it's just ListObjectsV2 + DeleteObjects + DeleteBucket).
-- **Conditional headers** on PUT/GET/HEAD/CopyObject: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, plus the copy-side `x-amz-copy-source-if-*` variants. `aws s3 sync` uses these to skip unchanged files; without them, sync re-PUTs everything every run.
-- **User metadata** (`x-amz-meta-*`). Currently dropped on PUT and never echoed back on GET/HEAD. Need a `meta` blob column on `objects` (json or query-string-encoded) and round-trip through Index.put / Index.get and the response header builders.
-- **Stub bucket sub-resources** — `GET /:bucket?location|acl|policy|versioning|cors|lifecycle|tagging`. We currently treat unknown query params as ListObjectsV2, which returns a list of objects to clients that asked for a config document — confusing. A handful of empty/200 stubs (or proper 404 NoSuchBucketPolicy / NoSuchTagSet error codes) avoids client-side fallout. `?location` is the most common — boto3 calls it on `head_bucket` follow-ups.
+Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (delimiter / pagination / encoding-type / fetch-owner), `?location|acl|versioning|policy|cors|lifecycle|tagging` stubs, PutObject (with `If-Match`/`If-None-Match`), GetObject (Range, all four conditional headers), HeadObject, DeleteObject, multipart Initiate/UploadPart/Complete/Abort/ListMultipartUploads/ListParts (Initiate carries user metadata through to Complete), CopyObject (with `x-amz-copy-source-if-*`), UploadPartCopy, DeleteObjects (multi-delete), aws-chunked unwrap, user metadata round-trip (`x-amz-meta-*`), NoSuchBucket gating, x-amz-request-id + error RequestId/HostId, x-amz-error-code on HEAD 404. End-to-end verified against real boto3 (990-image migration) and via curl wire tests.
 
 ### Tier 2 — nice-to-haves with realistic clients
 
-- **CopyObject metadata-directive=REPLACE** plus `x-amz-meta-*` on the copy. Lets clients change content-type or user metadata via a copy-to-self. Implementation depends on Tier-1 user-metadata work.
+- **CopyObject `x-amz-metadata-directive=REPLACE`.** Default COPY mode carries source meta forward (already done); REPLACE would take new `x-amz-meta-*` from the request and overwrite. Common pattern is "copy to self with new content-type" for content-type fixups.
 - **Multi-range GET** (`Range: bytes=0-100,200-300`) returning `multipart/byteranges`. Single-range only today. aws-cli doesn't issue these; some video tooling does.
 - **`x-amz-bucket-region` header on HeadBucket success.** Real S3 emits this so clients can route cross-region. Single fixed value (`us-east-1`) here.
 - **List-buckets pagination.** S3 caps at 1000 buckets per page; we don't paginate. Real homelab user is unlikely to hit this.
+- **Object-level tagging** (`PUT/GET/DELETE /:bucket/:key?tagging`). Distinct from bucket tagging (already stubbed as 404). boto3 sometimes calls these, mostly tolerable as 404 NoSuchTagSet.
+- **POST-form upload** (browser direct upload via signed policy). aws-cli doesn't use; web frontends do.
+- **Strict `If-Match`/`If-None-Match` etag-list semantics.** We currently honour wildcards and a single etag; multi-etag lists (`"a", "b"`) parse but the precedence around quoting/whitespace hasn't been stress-tested against odd clients.
 
 ### Tier 3 — explicitly out of scope unless asked
 
@@ -113,11 +115,7 @@ Done so far: ListAllMyBuckets, CreateBucket, HeadBucket, ListObjectsV2 (delimite
 
 ## Roadmap
 
-### 1. Tier-1 parity (next)
-DeleteBucket, conditional headers, user metadata, stub sub-resources. After these, `aws s3 sync` and `aws s3 rb` work cleanly and unknown bucket sub-resource queries don't return lists of objects.
-
-### 2. Phoenix admin UI (last per user direction)
-Light LiveView app. Probably its own OTP app inside an umbrella (or just a sibling Plug router on a separate port). Pages:
+Phoenix admin UI (last per user direction). Light LiveView app — probably its own OTP app inside an umbrella, or a sibling Plug router on a separate port. Pages:
 - Buckets list with object counts and total size (needs new aggregation queries on `objects`).
 - Per-bucket browser with prefix navigation (delimiter listing already does the work).
 - In-flight multipart uploads (`Index.list_uploads/2`) with abort buttons.

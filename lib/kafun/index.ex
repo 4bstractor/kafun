@@ -19,14 +19,21 @@ defmodule Kafun.Index do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: @name)
 
-  @spec put(String.t(), String.t(), non_neg_integer(), String.t(), String.t() | nil, integer()) ::
-          :ok
-  def put(bucket, key, size, etag, content_type, mtime) do
-    GenServer.call(@name, {:put, bucket, key, size, etag, content_type, mtime})
+  @spec put(String.t(), String.t(), non_neg_integer(), String.t(), String.t() | nil, integer(),
+            %{optional(String.t()) => String.t()}) :: :ok
+  def put(bucket, key, size, etag, content_type, mtime, meta \\ %{}) do
+    GenServer.call(@name, {:put, bucket, key, size, etag, content_type, mtime, meta})
   end
 
   @spec get(String.t(), String.t()) ::
-          {:ok, %{size: non_neg_integer(), etag: String.t(), content_type: String.t() | nil, mtime: integer()}}
+          {:ok,
+           %{
+             size: non_neg_integer(),
+             etag: String.t(),
+             content_type: String.t() | nil,
+             mtime: integer(),
+             meta: %{optional(String.t()) => String.t()}
+           }}
           | :not_found
   def get(bucket, key), do: GenServer.call(@name, {:get, bucket, key})
 
@@ -41,6 +48,14 @@ defmodule Kafun.Index do
 
   @spec bucket_exists?(String.t()) :: boolean()
   def bucket_exists?(name), do: GenServer.call(@name, {:bucket_exists?, name})
+
+  @doc """
+  Drop a bucket from the index. Errors if it doesn't exist or still holds
+  any objects (S3's `BucketNotEmpty` semantics). Removing the on-disk
+  shard tree is the caller's job.
+  """
+  @spec delete_bucket(String.t()) :: :ok | {:error, :not_found | :not_empty}
+  def delete_bucket(name), do: GenServer.call(@name, {:delete_bucket, name})
 
   @doc """
   ListObjectsV2 with prefix + delimiter + pagination.
@@ -62,13 +77,20 @@ defmodule Kafun.Index do
            String.t() | nil}
   def list(bucket, opts \\ []), do: GenServer.call(@name, {:list, bucket, opts})
 
-  @spec init_upload(String.t(), String.t(), String.t(), String.t() | nil) :: :ok
-  def init_upload(upload_id, bucket, key, content_type) do
-    GenServer.call(@name, {:init_upload, upload_id, bucket, key, content_type})
+  @spec init_upload(String.t(), String.t(), String.t(), String.t() | nil,
+                    %{optional(String.t()) => String.t()}) :: :ok
+  def init_upload(upload_id, bucket, key, content_type, meta \\ %{}) do
+    GenServer.call(@name, {:init_upload, upload_id, bucket, key, content_type, meta})
   end
 
   @spec get_upload(String.t()) ::
-          {:ok, %{bucket: String.t(), key: String.t(), content_type: String.t() | nil}}
+          {:ok,
+           %{
+             bucket: String.t(),
+             key: String.t(),
+             content_type: String.t() | nil,
+             meta: %{optional(String.t()) => String.t()}
+           }}
           | :not_found
   def get_upload(upload_id), do: GenServer.call(@name, {:get_upload, upload_id})
 
@@ -142,6 +164,7 @@ defmodule Kafun.Index do
         etag         TEXT NOT NULL,
         content_type TEXT,
         mtime        INTEGER NOT NULL,
+        meta         TEXT NOT NULL DEFAULT '{}',
         PRIMARY KEY (bucket, key)
       ) WITHOUT ROWID
       """)
@@ -161,7 +184,8 @@ defmodule Kafun.Index do
         bucket       TEXT NOT NULL,
         key          TEXT NOT NULL,
         content_type TEXT,
-        initiated_at INTEGER NOT NULL
+        initiated_at INTEGER NOT NULL,
+        meta         TEXT NOT NULL DEFAULT '{}'
       ) WITHOUT ROWID
       """)
 
@@ -177,11 +201,20 @@ defmodule Kafun.Index do
       ) WITHOUT ROWID
       """)
 
-    # Idempotent migration: add mtime to legacy `parts` rows.
-    case Sqlite3.execute(conn, "ALTER TABLE parts ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0") do
-      :ok -> :ok
-      {:error, _already_exists} -> :ok
-    end
+    # Idempotent migrations for legacy DBs.
+    Enum.each(
+      [
+        "ALTER TABLE parts ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE objects ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE uploads ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'"
+      ],
+      fn sql ->
+        case Sqlite3.execute(conn, sql) do
+          :ok -> :ok
+          {:error, _already_exists} -> :ok
+        end
+      end
+    )
 
     # Indexes for the multipart-listing and GC paths. PK on `uploads` is
     # `upload_id` so listing-by-bucket would otherwise scan the whole table.
@@ -204,17 +237,18 @@ defmodule Kafun.Index do
     %{
       put:
         prep(conn, """
-        INSERT INTO objects (bucket, key, size, etag, content_type, mtime)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO objects (bucket, key, size, etag, content_type, mtime, meta)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (bucket, key) DO UPDATE SET
           size = excluded.size,
           etag = excluded.etag,
           content_type = excluded.content_type,
-          mtime = excluded.mtime
+          mtime = excluded.mtime,
+          meta = excluded.meta
         """),
       get:
         prep(conn, """
-        SELECT size, etag, content_type, mtime FROM objects
+        SELECT size, etag, content_type, mtime, meta FROM objects
         WHERE bucket = ? AND key = ?
         """),
       delete: prep(conn, "DELETE FROM objects WHERE bucket = ? AND key = ?"),
@@ -222,6 +256,8 @@ defmodule Kafun.Index do
         prep(conn, "INSERT OR IGNORE INTO buckets (name, created_at) VALUES (?, ?)"),
       list_buckets: prep(conn, "SELECT name, created_at FROM buckets ORDER BY name"),
       bucket_exists: prep(conn, "SELECT 1 FROM buckets WHERE name = ? LIMIT 1"),
+      bucket_has_objects: prep(conn, "SELECT 1 FROM objects WHERE bucket = ? LIMIT 1"),
+      delete_bucket: prep(conn, "DELETE FROM buckets WHERE name = ?"),
       list_open:
         prep(conn, """
         SELECT key, size, etag, mtime FROM objects
@@ -236,12 +272,12 @@ defmodule Kafun.Index do
         """),
       init_upload:
         prep(conn, """
-        INSERT INTO uploads (upload_id, bucket, key, content_type, initiated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO uploads (upload_id, bucket, key, content_type, initiated_at, meta)
+        VALUES (?, ?, ?, ?, ?, ?)
         """),
       get_upload:
         prep(conn, """
-        SELECT bucket, key, content_type FROM uploads WHERE upload_id = ?
+        SELECT bucket, key, content_type, meta FROM uploads WHERE upload_id = ?
         """),
       record_part:
         prep(conn, """
@@ -289,16 +325,24 @@ defmodule Kafun.Index do
   end
 
   @impl true
-  def handle_call({:put, b, k, sz, etag, ct, mt}, _from, state) do
-    run(state, :put, [b, k, sz, etag, ct, mt])
+  def handle_call({:put, b, k, sz, etag, ct, mt, meta}, _from, state) do
+    run(state, :put, [b, k, sz, etag, ct, mt, encode_meta(meta)])
     ensure_bucket_inline(state, b)
     {:reply, :ok, state}
   end
 
   def handle_call({:get, b, k}, _from, state) do
     case fetch_one(state, :get, [b, k]) do
-      [size, etag, ct, mtime] ->
-        {:reply, {:ok, %{size: size, etag: etag, content_type: ct, mtime: mtime}}, state}
+      [size, etag, ct, mtime, meta_json] ->
+        {:reply,
+         {:ok,
+          %{
+            size: size,
+            etag: etag,
+            content_type: ct,
+            mtime: mtime,
+            meta: decode_meta(meta_json)
+          }}, state}
 
       nil ->
         {:reply, :not_found, state}
@@ -331,6 +375,23 @@ defmodule Kafun.Index do
     {:reply, exists, state}
   end
 
+  def handle_call({:delete_bucket, name}, _from, state) do
+    reply =
+      cond do
+        fetch_one(state, :bucket_exists, [name]) == nil ->
+          {:error, :not_found}
+
+        fetch_one(state, :bucket_has_objects, [name]) != nil ->
+          {:error, :not_empty}
+
+        true ->
+          run(state, :delete_bucket, [name])
+          :ok
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call({:list, bucket, opts}, _from, state) do
     prefix = Keyword.get(opts, :prefix, "")
     delimiter = Keyword.get(opts, :delimiter)
@@ -349,15 +410,19 @@ defmodule Kafun.Index do
     {:reply, result, state}
   end
 
-  def handle_call({:init_upload, id, b, k, ct}, _from, state) do
-    run(state, :init_upload, [id, b, k, ct, System.system_time(:second)])
+  def handle_call({:init_upload, id, b, k, ct, meta}, _from, state) do
+    run(state, :init_upload, [id, b, k, ct, System.system_time(:second), encode_meta(meta)])
     {:reply, :ok, state}
   end
 
   def handle_call({:get_upload, id}, _from, state) do
     case fetch_one(state, :get_upload, [id]) do
-      [b, k, ct] -> {:reply, {:ok, %{bucket: b, key: k, content_type: ct}}, state}
-      nil -> {:reply, :not_found, state}
+      [b, k, ct, meta_json] ->
+        {:reply,
+         {:ok, %{bucket: b, key: k, content_type: ct, meta: decode_meta(meta_json)}}, state}
+
+      nil ->
+        {:reply, :not_found, state}
     end
   end
 
@@ -514,6 +579,28 @@ defmodule Kafun.Index do
       {:row, row} -> drain(conn, stmt, [row | acc])
       :done -> Enum.reverse(acc)
     end
+  end
+
+  # User metadata is stored as a JSON object of {String.t => String.t}. We use
+  # OTP 27's built-in `:json` module so there's no extra dep, and the column
+  # stays human-inspectable from the sqlite3 CLI.
+  defp encode_meta(meta) when is_map(meta) do
+    meta
+    |> Map.new(fn {k, v} -> {to_string(k), to_string(v)} end)
+    |> :json.encode()
+    |> IO.iodata_to_binary()
+  end
+
+  defp decode_meta(""), do: %{}
+  defp decode_meta(nil), do: %{}
+
+  defp decode_meta(json) when is_binary(json) do
+    case :json.decode(json) do
+      m when is_map(m) -> m
+      _ -> %{}
+    end
+  rescue
+    _ -> %{}
   end
 
   defp ensure_bucket_inline(state, name) do

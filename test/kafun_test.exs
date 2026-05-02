@@ -593,6 +593,344 @@ defmodule KafunTest do
     end
   end
 
+  describe "Bucket sub-resource stubs" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-stub-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      :ok
+    end
+
+    test "?location returns LocationConstraint with the kafun region" do
+      conn =
+        Plug.Test.conn(:get, "/imouto?location") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<LocationConstraint"
+      assert conn.resp_body =~ "us-east-1"
+    end
+
+    test "?acl returns a stub AccessControlPolicy with FULL_CONTROL" do
+      conn =
+        Plug.Test.conn(:get, "/imouto?acl") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<AccessControlPolicy"
+      assert conn.resp_body =~ "<Permission>FULL_CONTROL</Permission>"
+    end
+
+    test "?versioning returns an empty VersioningConfiguration" do
+      conn =
+        Plug.Test.conn(:get, "/imouto?versioning") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<VersioningConfiguration"
+    end
+
+    test "?policy returns 404 NoSuchBucketPolicy" do
+      conn = Plug.Test.conn(:get, "/imouto?policy") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchBucketPolicy"
+    end
+
+    test "?cors returns 404 NoSuchCORSConfiguration" do
+      conn = Plug.Test.conn(:get, "/imouto?cors") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchCORSConfiguration"
+    end
+
+    test "?lifecycle returns 404 NoSuchLifecycleConfiguration" do
+      conn =
+        Plug.Test.conn(:get, "/imouto?lifecycle") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchLifecycleConfiguration"
+    end
+
+    test "?tagging returns 404 NoSuchTagSet" do
+      conn = Plug.Test.conn(:get, "/imouto?tagging") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchTagSet"
+    end
+
+    test "stub queries on a missing bucket still return NoSuchBucket" do
+      conn =
+        Plug.Test.conn(:get, "/ghost?location") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchBucket"
+    end
+  end
+
+  describe "Router DeleteBucket" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-delbucket-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      %{root: tmp}
+    end
+
+    test "204 on a created, empty bucket; bucket no longer exists afterwards", %{root: root} do
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert Index.bucket_exists?("imouto")
+
+      conn = Plug.Test.conn(:delete, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 204
+      assert conn.resp_body == ""
+
+      refute Index.bucket_exists?("imouto")
+      refute File.exists?(Path.join(root, "imouto"))
+    end
+
+    test "404 NoSuchBucket on a never-created bucket" do
+      conn = Plug.Test.conn(:delete, "/never") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchBucket"
+    end
+
+    test "409 BucketNotEmpty when objects remain" do
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      Plug.Test.conn(:put, "/imouto/k", "x") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      conn = Plug.Test.conn(:delete, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 409
+      assert conn.resp_body =~ "BucketNotEmpty"
+      assert Index.bucket_exists?("imouto")
+    end
+
+    test "delete-then-recreate works (the bucket dir gets re-created on PUT)" do
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      Plug.Test.conn(:delete, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      recreate =
+        Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert recreate.status == 200
+      assert Index.bucket_exists?("imouto")
+    end
+  end
+
+  describe "Conditional headers" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-cond-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      put_conn =
+        Plug.Test.conn(:put, "/imouto/k", "hello")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      [quoted_etag] = Plug.Conn.get_resp_header(put_conn, "etag")
+      etag = String.trim(quoted_etag, ~s|"|)
+
+      %{etag: etag}
+    end
+
+    test "GET If-None-Match matching the current etag returns 304", %{etag: etag} do
+      conn =
+        Plug.Test.conn(:get, "/imouto/k")
+        |> Plug.Conn.put_req_header("if-none-match", ~s|"#{etag}"|)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 304
+      assert conn.resp_body == ""
+      assert [_etag] = Plug.Conn.get_resp_header(conn, "etag")
+    end
+
+    test "GET If-None-Match: * always returns 304 for an existing object" do
+      conn =
+        Plug.Test.conn(:get, "/imouto/k")
+        |> Plug.Conn.put_req_header("if-none-match", "*")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 304
+    end
+
+    test "GET If-Match with a stale etag returns 412 PreconditionFailed" do
+      conn =
+        Plug.Test.conn(:get, "/imouto/k")
+        |> Plug.Conn.put_req_header("if-match", ~s|"deadbeef"|)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 412
+      assert conn.resp_body =~ "PreconditionFailed"
+    end
+
+    test "GET If-Modified-Since in the future returns 304" do
+      future = DateTime.utc_now() |> DateTime.add(3600, :second)
+      hdr = Calendar.strftime(future, "%a, %d %b %Y %H:%M:%S GMT")
+
+      conn =
+        Plug.Test.conn(:get, "/imouto/k")
+        |> Plug.Conn.put_req_header("if-modified-since", hdr)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 304
+    end
+
+    test "GET If-Unmodified-Since in the past returns 412" do
+      past = DateTime.utc_now() |> DateTime.add(-3600, :second)
+      hdr = Calendar.strftime(past, "%a, %d %b %Y %H:%M:%S GMT")
+
+      conn =
+        Plug.Test.conn(:get, "/imouto/k")
+        |> Plug.Conn.put_req_header("if-unmodified-since", hdr)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 412
+    end
+
+    test "PUT If-None-Match: * fails with 412 when the key already exists" do
+      conn =
+        Plug.Test.conn(:put, "/imouto/k", "would overwrite")
+        |> Plug.Conn.put_req_header("if-none-match", "*")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 412
+
+      # Confirm the existing object was not overwritten.
+      get = Plug.Test.conn(:get, "/imouto/k") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert get.resp_body == "hello"
+    end
+
+    test "PUT If-None-Match: * succeeds for a brand-new key" do
+      conn =
+        Plug.Test.conn(:put, "/imouto/fresh", "new")
+        |> Plug.Conn.put_req_header("if-none-match", "*")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "PUT If-Match: * fails with 412 when the key does not exist" do
+      conn =
+        Plug.Test.conn(:put, "/imouto/missing", "x")
+        |> Plug.Conn.put_req_header("if-match", "*")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 412
+    end
+
+    test "CopyObject x-amz-copy-source-if-match with matching etag succeeds", %{etag: etag} do
+      conn =
+        Plug.Test.conn(:put, "/imouto/dst", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/k")
+        |> Plug.Conn.put_req_header("x-amz-copy-source-if-match", ~s|"#{etag}"|)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "CopyObject x-amz-copy-source-if-match mismatching returns 412" do
+      conn =
+        Plug.Test.conn(:put, "/imouto/dst", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/k")
+        |> Plug.Conn.put_req_header("x-amz-copy-source-if-match", ~s|"deadbeef"|)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 412
+    end
+
+    test "CopyObject x-amz-copy-source-if-none-match matching returns 412", %{etag: etag} do
+      conn =
+        Plug.Test.conn(:put, "/imouto/dst", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/k")
+        |> Plug.Conn.put_req_header("x-amz-copy-source-if-none-match", ~s|"#{etag}"|)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 412
+    end
+  end
+
+  describe "User metadata round-trip" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-meta-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      :ok
+    end
+
+    test "PUT preserves x-amz-meta-* headers, GET and HEAD echo them back" do
+      Plug.Test.conn(:put, "/imouto/key", "body")
+      |> Plug.Conn.put_req_header("x-amz-meta-author", "naka")
+      |> Plug.Conn.put_req_header("x-amz-meta-source", "kafun-test")
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      get_conn = Plug.Test.conn(:get, "/imouto/key") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert get_conn.status == 200
+      assert ["naka"] = Plug.Conn.get_resp_header(get_conn, "x-amz-meta-author")
+      assert ["kafun-test"] = Plug.Conn.get_resp_header(get_conn, "x-amz-meta-source")
+
+      head_conn = Plug.Test.conn(:head, "/imouto/key") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert head_conn.status == 200
+      assert ["naka"] = Plug.Conn.get_resp_header(head_conn, "x-amz-meta-author")
+    end
+
+    test "PUT without metadata does not emit x-amz-meta-* headers on GET" do
+      Plug.Test.conn(:put, "/imouto/k", "body") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      conn = Plug.Test.conn(:get, "/imouto/k") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert Enum.all?(conn.resp_headers, fn {k, _} -> not String.starts_with?(k, "x-amz-meta-") end)
+    end
+
+    test "CopyObject (default COPY) preserves source metadata on the destination" do
+      Plug.Test.conn(:put, "/imouto/src", "src body")
+      |> Plug.Conn.put_req_header("x-amz-meta-tag", "carry-me")
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      Plug.Test.conn(:put, "/imouto/dst", "")
+      |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/src")
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      conn = Plug.Test.conn(:head, "/imouto/dst") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert ["carry-me"] = Plug.Conn.get_resp_header(conn, "x-amz-meta-tag")
+    end
+
+    test "metadata supplied at multipart Initiate is applied on Complete" do
+      init =
+        Plug.Test.conn(:post, "/imouto/big?uploads")
+        |> Plug.Conn.put_req_header("x-amz-meta-flavour", "vanilla")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      [_, upload_id] =
+        Regex.run(~r{<UploadId>(.+?)</UploadId>}, init.resp_body)
+
+      part_conn =
+        Plug.Test.conn(:put, "/imouto/big?partNumber=1&uploadId=#{upload_id}", "hello mp")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      [quoted] = Plug.Conn.get_resp_header(part_conn, "etag")
+      part_etag = String.trim(quoted, ~s|"|)
+
+      complete_xml =
+        ~s|<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"#{part_etag}"</ETag></Part></CompleteMultipartUpload>|
+
+      Plug.Test.conn(:post, "/imouto/big?uploadId=#{upload_id}", complete_xml)
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      head = Plug.Test.conn(:head, "/imouto/big") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert ["vanilla"] = Plug.Conn.get_resp_header(head, "x-amz-meta-flavour")
+    end
+  end
+
   describe "Router CopyObject + UploadPartCopy" do
     setup do
       tmp = Path.join(System.tmp_dir!(), "kafun-copy-#{System.unique_integer([:positive])}")

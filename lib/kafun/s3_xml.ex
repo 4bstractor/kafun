@@ -279,6 +279,40 @@ defmodule Kafun.S3XML do
     end
   end
 
+  @doc "GetBucketLocation response. Always reports our single fixed region."
+  @spec bucket_location() :: iodata()
+  def bucket_location do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<LocationConstraint xmlns="#{@ns}">us-east-1</LocationConstraint>|
+    ]
+  end
+
+  @doc "GetBucketAcl stub. Reports a single FULL_CONTROL grant to the kafun owner."
+  @spec bucket_acl() :: iodata()
+  def bucket_acl do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<AccessControlPolicy xmlns="#{@ns}">|,
+      "<Owner><ID>kafun</ID><DisplayName>kafun</DisplayName></Owner>",
+      "<AccessControlList><Grant>",
+      ~s|<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">|,
+      "<ID>kafun</ID><DisplayName>kafun</DisplayName></Grantee>",
+      "<Permission>FULL_CONTROL</Permission>",
+      "</Grant></AccessControlList>",
+      "</AccessControlPolicy>"
+    ]
+  end
+
+  @doc "GetBucketVersioning stub. Empty body = unversioned."
+  @spec bucket_versioning() :: iodata()
+  def bucket_versioning do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<VersioningConfiguration xmlns="#{@ns}"/>|
+    ]
+  end
+
   @doc "CopyObject response body."
   @spec copy_object_result(String.t(), integer()) :: iodata()
   def copy_object_result(etag, last_modified_unix) do

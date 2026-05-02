@@ -14,10 +14,11 @@ defmodule Kafun.Multipart do
     :crypto.strong_rand_bytes(18) |> Base.url_encode64(padding: false)
   end
 
-  @spec initiate(String.t(), String.t(), String.t() | nil) :: {:ok, String.t()}
-  def initiate(bucket, key, content_type) do
+  @spec initiate(String.t(), String.t(), String.t() | nil,
+                 %{optional(String.t()) => String.t()}) :: {:ok, String.t()}
+  def initiate(bucket, key, content_type, meta \\ %{}) do
     upload_id = new_upload_id()
-    :ok = Index.init_upload(upload_id, bucket, key, content_type)
+    :ok = Index.init_upload(upload_id, bucket, key, content_type, meta)
     {:ok, upload_id}
   end
 
@@ -62,7 +63,8 @@ defmodule Kafun.Multipart do
           total,
           etag,
           upload.content_type,
-          System.system_time(:second)
+          System.system_time(:second),
+          Map.get(upload, :meta, %{})
         )
 
       :ok = Index.clear_upload(upload_id)
