@@ -36,7 +36,9 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 **Streaming PUT.** `Storage.stream_put/4` opens `<final>.tmp.<rand>` in the destination shard, drains `Plug.Conn.read_body` in 64 KiB chunks, hashes MD5 inline (S3-canonical ETag for non-multipart), then `:file.rename` to publish atomically. Errors unlink the temp. The streaming hash means we never hold the body in memory, even for multi-GB PUTs.
 
-**Listing.** Prefix queries are converted to a half-open byte range via `Index.upper_bound/1` (rightmost-non-`0xFF` byte +1, carrying through trailing `0xFF`s). The all-`0xFF` case has no expressible upper bound; the code falls back to a `>= prefix` scan there. We over-fetch by one row to know whether to set `IsTruncated=true` and emit a `NextContinuationToken` (base64url of the last key). **No delimiter / common-prefixes support yet** — adding it means iterating page rows in the GenServer and re-binding the lower bound when we cross a delimiter (see comment block in `Kafun.Index.handle_call({:list, ...})`).
+**Listing.** Prefix queries are converted to a half-open byte range via `Index.upper_bound/1` (rightmost-non-`0xFF` byte +1, carrying through trailing `0xFF`s). Delimiter / common-prefixes is implemented as a multi-page scanner in `Kafun.Index.scan_loop/11`: as we walk rows, classify each key as `:content` or `{:cp, prefix}`; when emitting a CP we set the active `in_cp` so subsequent rows starting with it are skipped, and the next-page lower bound becomes `upper_bound(cp)` so a re-query naturally jumps over the whole subtree. Cursors are `>=` (inclusive) — the continuation token is base64url(lower_bound). `start-after` from S3 callers is mapped to `key <> <<0>>` so we can keep one SQL shape. After hitting `max_keys`, a 1-row peek confirms whether truncation is real before setting `IsTruncated=true` (avoids the trailing-empty-page footgun).
+
+**Multipart listing.** `GET /:bucket?uploads` returns `ListMultipartUploadsResult` paginated by the `(key, upload_id)` tuple — matches S3. `GET /:bucket/:key?uploadId=…` returns `ListPartsResult` paginated by `part-number-marker`. The router's GET handler branches on the presence of `?uploadId=` (object GET vs ListParts) and `?uploads` (object listing vs in-progress upload listing). Parts now carry `mtime`; the column was added with an idempotent `ALTER TABLE` migration in `Index.init/1` so existing DBs upgrade in place.
 
 **Index concurrency.** One GenServer owns the SQLite handle and serializes both reads and writes. WAL is on, but we don't exploit it — every call queues. For homelab volumes this is fine; if it becomes a bottleneck, the upgrade path is a `NimblePool` of read connections (writes still through the GenServer to keep `INSERT OR REPLACE` race-free).
 
@@ -52,9 +54,8 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 ## What's deliberately missing
 
-- `ListMultipartUploads` (`GET /:bucket?uploads`) and `ListParts` (`GET /:bucket/:key?uploadId=…`) — boto3 doesn't need these for the upload happy path; aws-cli does for `ls --recursive` of in-progress uploads. The admin UI will want these for visibility.
 - `UploadPartCopy` (`PUT /:bucket/:key?partNumber=…&uploadId=…` with `x-amz-copy-source`) — server-side range copy for assembling a new object from chunks of an existing one.
-- Delimiter / common-prefixes in ListObjectsV2. Most boto3 callers don't need it; `aws s3 ls s3://bucket/path/` does.
+- `CopyObject` (`PUT` with `x-amz-copy-source`).
 - Versioning, ACLs, bucket policies, server-side encryption.
 - Content-addressed dedupe. Easy to retrofit: rename the on-disk file to `sha256(body)` and add a refcount in the index. Worth it on a homelab where the same wallpaper / backup tarball ends up in multiple buckets.
 - A blob-tree sweep in GC. Today the GC handles uploads only; orphan *blobs* (where the rename succeeded but the index commit didn't) still leak. Add a third pass that walks `<root>/<bucket>/<aa>/<bb>/` and `Index.get/2`s each entry, deleting rows-less files older than some grace.

@@ -27,10 +27,12 @@ defmodule Kafun.S3XML do
   end
 
   @doc """
-  ListBucketResult (S3 ListObjectsV2). `entries` are maps with
-  `:key, :size, :etag, :mtime`; `next` is the continuation key or nil.
+  ListBucketResult (S3 ListObjectsV2) — supports prefix + delimiter + pagination.
+  `entries` are object maps; `common_prefixes` is a list of strings; `next` is
+  the inclusive lower-bound for the next page (encoded into a continuation token)
+  or `nil` when not truncated.
   """
-  def list_objects(bucket, prefix, max_keys, entries, truncated?, next) do
+  def list_objects(bucket, prefix, delimiter, max_keys, entries, common_prefixes, truncated?, next) do
     [
       ~s|<?xml version="1.0" encoding="UTF-8"?>|,
       ~s|<ListBucketResult xmlns="#{@ns}">|,
@@ -40,8 +42,9 @@ defmodule Kafun.S3XML do
       "<Prefix>",
       esc(prefix),
       "</Prefix>",
+      if(delimiter, do: ["<Delimiter>", esc(delimiter), "</Delimiter>"], else: []),
       "<KeyCount>",
-      Integer.to_string(length(entries)),
+      Integer.to_string(length(entries) + length(common_prefixes)),
       "</KeyCount>",
       "<MaxKeys>",
       Integer.to_string(max_keys),
@@ -72,7 +75,119 @@ defmodule Kafun.S3XML do
           "</Contents>"
         ]
       end),
+      Enum.map(common_prefixes, fn cp ->
+        ["<CommonPrefixes><Prefix>", esc(cp), "</Prefix></CommonPrefixes>"]
+      end),
       "</ListBucketResult>"
+    ]
+  end
+
+  @doc "ListMultipartUploadsResult — body of `GET /:bucket?uploads`."
+  def list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker,
+                             max_uploads, uploads, truncated?, next_key, next_uid) do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<ListMultipartUploadsResult xmlns="#{@ns}">|,
+      "<Bucket>",
+      esc(bucket),
+      "</Bucket>",
+      "<KeyMarker>",
+      esc(key_marker || ""),
+      "</KeyMarker>",
+      "<UploadIdMarker>",
+      esc(upload_id_marker || ""),
+      "</UploadIdMarker>",
+      if(truncated? and next_key,
+        do: [
+          "<NextKeyMarker>",
+          esc(next_key),
+          "</NextKeyMarker>",
+          "<NextUploadIdMarker>",
+          esc(next_uid || ""),
+          "</NextUploadIdMarker>"
+        ],
+        else: []
+      ),
+      "<Prefix>",
+      esc(prefix || ""),
+      "</Prefix>",
+      "<MaxUploads>",
+      Integer.to_string(max_uploads),
+      "</MaxUploads>",
+      "<IsTruncated>",
+      if(truncated?, do: "true", else: "false"),
+      "</IsTruncated>",
+      Enum.map(uploads, fn %{key: k, upload_id: uid, initiated_at: ts} ->
+        [
+          "<Upload>",
+          "<Key>",
+          esc(k),
+          "</Key>",
+          "<UploadId>",
+          esc(uid),
+          "</UploadId>",
+          "<Initiator><ID>kafun</ID><DisplayName>kafun</DisplayName></Initiator>",
+          "<Owner><ID>kafun</ID><DisplayName>kafun</DisplayName></Owner>",
+          "<StorageClass>STANDARD</StorageClass>",
+          "<Initiated>",
+          iso8601(ts),
+          "</Initiated>",
+          "</Upload>"
+        ]
+      end),
+      "</ListMultipartUploadsResult>"
+    ]
+  end
+
+  @doc "ListPartsResult — body of `GET /:bucket/:key?uploadId=…`."
+  def list_parts(bucket, key, upload_id, marker, max_parts, parts, truncated?, next_marker) do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<ListPartsResult xmlns="#{@ns}">|,
+      "<Bucket>",
+      esc(bucket),
+      "</Bucket>",
+      "<Key>",
+      esc(key),
+      "</Key>",
+      "<UploadId>",
+      esc(upload_id),
+      "</UploadId>",
+      "<PartNumberMarker>",
+      Integer.to_string(marker),
+      "</PartNumberMarker>",
+      if(truncated? and next_marker,
+        do: ["<NextPartNumberMarker>", Integer.to_string(next_marker), "</NextPartNumberMarker>"],
+        else: []
+      ),
+      "<MaxParts>",
+      Integer.to_string(max_parts),
+      "</MaxParts>",
+      "<IsTruncated>",
+      if(truncated?, do: "true", else: "false"),
+      "</IsTruncated>",
+      "<Initiator><ID>kafun</ID><DisplayName>kafun</DisplayName></Initiator>",
+      "<Owner><ID>kafun</ID><DisplayName>kafun</DisplayName></Owner>",
+      "<StorageClass>STANDARD</StorageClass>",
+      Enum.map(parts, fn %{part_number: n, size: sz, etag: etag, mtime: mt} ->
+        [
+          "<Part>",
+          "<PartNumber>",
+          Integer.to_string(n),
+          "</PartNumber>",
+          "<LastModified>",
+          iso8601(mt),
+          "</LastModified>",
+          ~s|<ETag>"|,
+          esc(etag),
+          ~s|"</ETag>|,
+          "<Size>",
+          Integer.to_string(sz),
+          "</Size>",
+          "</Part>"
+        ]
+      end),
+      "</ListPartsResult>"
     ]
   end
 

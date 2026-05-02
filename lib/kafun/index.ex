@@ -40,17 +40,23 @@ defmodule Kafun.Index do
   def list_buckets, do: GenServer.call(@name, :list_buckets)
 
   @doc """
-  Paginated list within a bucket. Options:
-    * `:prefix` — keys must start with this string
-    * `:start_after` — strict lower bound (used for continuation)
-    * `:max_keys` — page size (default/cap 1000)
+  ListObjectsV2 with prefix + delimiter + pagination.
 
-  Returns `{entries, truncated?, next_token}` where `next_token` is the last
-  key of the page when truncated, otherwise `nil`.
+  Options:
+    * `:prefix` — string prefix
+    * `:delimiter` — string delimiter (typically "/") to roll up common prefixes
+    * `:start_after` — strict (`>`) lower bound from S3 client
+    * `:continuation` — inclusive (`>=`) lower bound used for our own continuation tokens
+    * `:max_keys` — page size cap (default/cap 1000)
+
+  Returns `{entries, common_prefixes, truncated?, next_lower_bound}`. When truncated,
+  `next_lower_bound` is the inclusive lower bound for the next page (caller encodes it).
   """
   @spec list(String.t(), keyword()) ::
           {[%{key: String.t(), size: non_neg_integer(), etag: String.t(), mtime: integer()}],
-           boolean(), String.t() | nil}
+           [String.t()],
+           boolean(),
+           String.t() | nil}
   def list(bucket, opts \\ []), do: GenServer.call(@name, {:list, bucket, opts})
 
   @spec init_upload(String.t(), String.t(), String.t(), String.t() | nil) :: :ok
@@ -63,14 +69,37 @@ defmodule Kafun.Index do
           | :not_found
   def get_upload(upload_id), do: GenServer.call(@name, {:get_upload, upload_id})
 
-  @spec record_part(String.t(), pos_integer(), non_neg_integer(), String.t()) :: :ok
-  def record_part(upload_id, part_number, size, etag) do
-    GenServer.call(@name, {:record_part, upload_id, part_number, size, etag})
+  @spec record_part(String.t(), pos_integer(), non_neg_integer(), String.t(), integer()) :: :ok
+  def record_part(upload_id, part_number, size, etag, mtime) do
+    GenServer.call(@name, {:record_part, upload_id, part_number, size, etag, mtime})
   end
 
   @spec list_parts(String.t()) ::
-          [%{part_number: pos_integer(), size: non_neg_integer(), etag: String.t()}]
+          [%{part_number: pos_integer(), size: non_neg_integer(), etag: String.t(), mtime: integer()}]
   def list_parts(upload_id), do: GenServer.call(@name, {:list_parts, upload_id})
+
+  @doc """
+  Paginated `parts` listing. `part_number_marker` is exclusive (S3 semantics).
+  Returns `{entries, truncated?, next_marker}`.
+  """
+  @spec list_parts_paged(String.t(), keyword()) ::
+          {[%{part_number: pos_integer(), size: non_neg_integer(), etag: String.t(), mtime: integer()}],
+           boolean(), pos_integer() | nil}
+  def list_parts_paged(upload_id, opts \\ []) do
+    GenServer.call(@name, {:list_parts_paged, upload_id, opts})
+  end
+
+  @doc """
+  Paginated multipart-upload listing for a bucket.
+
+  Options: `:prefix`, `:key_marker` (default ""), `:upload_id_marker` (default ""),
+  `:max_uploads` (default/cap 1000). Cursor is the `(key, upload_id)` pair —
+  matches S3 semantics. Returns `{entries, truncated?, next_key, next_upload_id}`.
+  """
+  @spec list_uploads(String.t(), keyword()) ::
+          {[%{key: String.t(), upload_id: String.t(), initiated_at: integer()}],
+           boolean(), String.t() | nil, String.t() | nil}
+  def list_uploads(bucket, opts \\ []), do: GenServer.call(@name, {:list_uploads, bucket, opts})
 
   @spec clear_upload(String.t()) :: :ok
   def clear_upload(upload_id), do: GenServer.call(@name, {:clear_upload, upload_id})
@@ -140,9 +169,16 @@ defmodule Kafun.Index do
         part_number INTEGER NOT NULL,
         size        INTEGER NOT NULL,
         etag        TEXT NOT NULL,
+        mtime       INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (upload_id, part_number)
       ) WITHOUT ROWID
       """)
+
+    # Idempotent migration: add mtime to legacy `parts` rows.
+    case Sqlite3.execute(conn, "ALTER TABLE parts ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0") do
+      :ok -> :ok
+      {:error, _already_exists} -> :ok
+    end
 
     {:ok, %State{conn: conn, stmts: prepare_all(conn)}}
   end
@@ -168,16 +204,16 @@ defmodule Kafun.Index do
       ensure_bucket:
         prep(conn, "INSERT OR IGNORE INTO buckets (name, created_at) VALUES (?, ?)"),
       list_buckets: prep(conn, "SELECT name, created_at FROM buckets ORDER BY name"),
-      list_all:
+      list_open:
         prep(conn, """
         SELECT key, size, etag, mtime FROM objects
-        WHERE bucket = ? AND key > ?
+        WHERE bucket = ? AND key >= ?
         ORDER BY key LIMIT ?
         """),
-      list_prefix:
+      list_range:
         prep(conn, """
         SELECT key, size, etag, mtime FROM objects
-        WHERE bucket = ? AND key > ? AND key >= ? AND key < ?
+        WHERE bucket = ? AND key >= ? AND key < ?
         ORDER BY key LIMIT ?
         """),
       init_upload:
@@ -191,20 +227,41 @@ defmodule Kafun.Index do
         """),
       record_part:
         prep(conn, """
-        INSERT INTO parts (upload_id, part_number, size, etag)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO parts (upload_id, part_number, size, etag, mtime)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (upload_id, part_number) DO UPDATE SET
-          size = excluded.size, etag = excluded.etag
+          size = excluded.size, etag = excluded.etag, mtime = excluded.mtime
         """),
       list_parts:
         prep(conn, """
-        SELECT part_number, size, etag FROM parts
+        SELECT part_number, size, etag, mtime FROM parts
         WHERE upload_id = ? ORDER BY part_number
+        """),
+      list_parts_paged:
+        prep(conn, """
+        SELECT part_number, size, etag, mtime FROM parts
+        WHERE upload_id = ? AND part_number > ?
+        ORDER BY part_number LIMIT ?
         """),
       drop_parts: prep(conn, "DELETE FROM parts WHERE upload_id = ?"),
       drop_upload: prep(conn, "DELETE FROM uploads WHERE upload_id = ?"),
       abandoned_uploads:
-        prep(conn, "SELECT upload_id FROM uploads WHERE initiated_at < ? ORDER BY initiated_at")
+        prep(conn, "SELECT upload_id FROM uploads WHERE initiated_at < ? ORDER BY initiated_at"),
+      list_uploads_all:
+        prep(conn, """
+        SELECT key, upload_id, initiated_at FROM uploads
+        WHERE bucket = ?
+          AND (key > ? OR (key = ? AND upload_id > ?))
+        ORDER BY key, upload_id LIMIT ?
+        """),
+      list_uploads_prefix:
+        prep(conn, """
+        SELECT key, upload_id, initiated_at FROM uploads
+        WHERE bucket = ?
+          AND (key > ? OR (key = ? AND upload_id > ?))
+          AND key >= ? AND key < ?
+        ORDER BY key, upload_id LIMIT ?
+        """)
     }
   end
 
@@ -248,40 +305,20 @@ defmodule Kafun.Index do
 
   def handle_call({:list, bucket, opts}, _from, state) do
     prefix = Keyword.get(opts, :prefix, "")
-    start_after = Keyword.get(opts, :start_after, "")
+    delimiter = Keyword.get(opts, :delimiter)
     max_keys = opts |> Keyword.get(:max_keys, 1000) |> max(1) |> min(1000)
 
-    rows =
-      case prefix do
-        "" ->
-          fetch_all(state, :list_all, [bucket, start_after, max_keys + 1])
-
-        _ ->
-          case upper_bound(prefix) do
-            nil ->
-              # Prefix is all 0xFF — degenerate; fall back to >= prefix only.
-              # Cheap path: use list_all with start_after = max(start_after, prefix - epsilon).
-              fetch_all(state, :list_all, [bucket, max(start_after, prefix), max_keys + 1])
-
-            upper ->
-              fetch_all(state, :list_prefix, [bucket, start_after, prefix, upper, max_keys + 1])
-          end
+    initial_lower =
+      cond do
+        cont = opts[:continuation] -> max(cont, prefix)
+        sa = opts[:start_after] -> max(sa <> <<0>>, prefix)
+        true -> prefix
       end
 
-    {entries, truncated} =
-      if length(rows) > max_keys do
-        {Enum.take(rows, max_keys), true}
-      else
-        {rows, false}
-      end
+    upper = if prefix == "", do: nil, else: upper_bound(prefix)
 
-    out =
-      Enum.map(entries, fn [k, sz, etag, mt] ->
-        %{key: k, size: sz, etag: etag, mtime: mt}
-      end)
-
-    next = if truncated, do: List.last(out).key, else: nil
-    {:reply, {out, truncated, next}, state}
+    result = scan(state, bucket, prefix, delimiter, initial_lower, upper, max_keys)
+    {:reply, result, state}
   end
 
   def handle_call({:init_upload, id, b, k, ct}, _from, state) do
@@ -296,15 +333,103 @@ defmodule Kafun.Index do
     end
   end
 
-  def handle_call({:record_part, id, n, sz, etag}, _from, state) do
-    run(state, :record_part, [id, n, sz, etag])
+  def handle_call({:record_part, id, n, sz, etag, mtime}, _from, state) do
+    run(state, :record_part, [id, n, sz, etag, mtime])
     {:reply, :ok, state}
   end
 
   def handle_call({:list_parts, id}, _from, state) do
     rows = fetch_all(state, :list_parts, [id])
-    out = Enum.map(rows, fn [n, sz, etag] -> %{part_number: n, size: sz, etag: etag} end)
+    out =
+      Enum.map(rows, fn [n, sz, etag, mtime] ->
+        %{part_number: n, size: sz, etag: etag, mtime: mtime}
+      end)
     {:reply, out, state}
+  end
+
+  def handle_call({:list_parts_paged, id, opts}, _from, state) do
+    marker = Keyword.get(opts, :part_number_marker, 0)
+    max_parts = opts |> Keyword.get(:max_parts, 1000) |> max(1) |> min(1000)
+    rows = fetch_all(state, :list_parts_paged, [id, marker, max_parts + 1])
+
+    {entries, truncated} =
+      if length(rows) > max_parts do
+        {Enum.take(rows, max_parts), true}
+      else
+        {rows, false}
+      end
+
+    out =
+      Enum.map(entries, fn [n, sz, etag, mtime] ->
+        %{part_number: n, size: sz, etag: etag, mtime: mtime}
+      end)
+
+    next = if truncated, do: List.last(out).part_number, else: nil
+    {:reply, {out, truncated, next}, state}
+  end
+
+  def handle_call({:list_uploads, bucket, opts}, _from, state) do
+    prefix = Keyword.get(opts, :prefix, "")
+    key_marker = Keyword.get(opts, :key_marker, "")
+    upload_id_marker = Keyword.get(opts, :upload_id_marker, "")
+    max_uploads = opts |> Keyword.get(:max_uploads, 1000) |> max(1) |> min(1000)
+
+    rows =
+      case prefix do
+        "" ->
+          fetch_all(state, :list_uploads_all, [
+            bucket,
+            key_marker,
+            key_marker,
+            upload_id_marker,
+            max_uploads + 1
+          ])
+
+        _ ->
+          case upper_bound(prefix) do
+            nil ->
+              fetch_all(state, :list_uploads_all, [
+                bucket,
+                max(key_marker, prefix),
+                key_marker,
+                upload_id_marker,
+                max_uploads + 1
+              ])
+
+            upper ->
+              fetch_all(state, :list_uploads_prefix, [
+                bucket,
+                key_marker,
+                key_marker,
+                upload_id_marker,
+                prefix,
+                upper,
+                max_uploads + 1
+              ])
+          end
+      end
+
+    {entries, truncated} =
+      if length(rows) > max_uploads do
+        {Enum.take(rows, max_uploads), true}
+      else
+        {rows, false}
+      end
+
+    out =
+      Enum.map(entries, fn [k, uid, ts] ->
+        %{key: k, upload_id: uid, initiated_at: ts}
+      end)
+
+    {next_key, next_uid} =
+      if truncated do
+        last = List.last(out)
+        {last.key, last.upload_id}
+      else
+        {nil, nil}
+      end
+
+    {:reply, {out, truncated, next_key, next_uid}, state}
   end
 
   def handle_call({:clear_upload, id}, _from, state) do
@@ -380,4 +505,126 @@ defmodule Kafun.Index do
   defp do_upper([0xFF | rest]), do: do_upper(rest)
   defp do_upper([b | rest]), do: [b + 1 | rest]
   defp do_upper([]), do: :overflow
+
+  ## ListObjectsV2 scanner with prefix + delimiter support.
+  ## Emits Contents and CommonPrefixes; returns next-page lower bound when truncated.
+
+  defp scan(state, bucket, prefix, delim, lower, upper, max_keys) do
+    scan_loop(state, bucket, prefix, delim, lower, upper, max_keys, [], [], nil, nil)
+  end
+
+  defp scan_loop(state, bucket, prefix, delim, lower, upper, max_keys, contents, cps, last_lower, in_cp) do
+    emitted = length(contents) + length(cps)
+
+    cond do
+      emitted >= max_keys ->
+        finalize(state, bucket, upper, contents, cps, last_lower)
+
+      true ->
+        fetch_n = (max_keys - emitted) * 2 + 1
+        rows = fetch_range(state, bucket, lower, upper, fetch_n)
+
+        case process_batch(rows, prefix, delim, max_keys, contents, cps, last_lower, in_cp) do
+          {:hit_max, c2, cp2, ll2} ->
+            finalize(state, bucket, upper, c2, cp2, ll2)
+
+          {:exhausted, c2, cp2, ll2, in_cp2, last_key} ->
+            cond do
+              length(rows) < fetch_n ->
+                {Enum.reverse(c2), Enum.reverse(cp2), false, nil}
+
+              true ->
+                new_lower = last_key <> <<0>>
+
+                scan_loop(
+                  state,
+                  bucket,
+                  prefix,
+                  delim,
+                  new_lower,
+                  upper,
+                  max_keys,
+                  c2,
+                  cp2,
+                  ll2,
+                  in_cp2
+                )
+            end
+        end
+    end
+  end
+
+  # We've filled `max_keys` — peek at the next row to decide if truncation is real.
+  defp finalize(state, bucket, upper, contents, cps, next_lower) do
+    case fetch_range(state, bucket, next_lower, upper, 1) do
+      [] ->
+        {Enum.reverse(contents), Enum.reverse(cps), false, nil}
+
+      _ ->
+        {Enum.reverse(contents), Enum.reverse(cps), true, next_lower}
+    end
+  end
+
+  defp process_batch(rows, prefix, delim, max_keys, contents, cps, last_lower, in_cp) do
+    do_process(rows, prefix, delim, max_keys, contents, cps, last_lower, in_cp, nil)
+  end
+
+  defp do_process([], _, _, _, c, cp, ll, in_cp, last_key) do
+    {:exhausted, c, cp, ll, in_cp, last_key}
+  end
+
+  defp do_process([row | rest], prefix, delim, max_keys, c, cp, ll, in_cp, _last) do
+    [key, sz, etag, mt] = row
+
+    cond do
+      in_cp != nil and String.starts_with?(key, in_cp) ->
+        do_process(rest, prefix, delim, max_keys, c, cp, ll, in_cp, key)
+
+      true ->
+        case classify(key, prefix, delim) do
+          :content ->
+            new_c = [%{key: key, size: sz, etag: etag, mtime: mt} | c]
+            new_ll = key <> <<0>>
+
+            if length(new_c) + length(cp) >= max_keys do
+              {:hit_max, new_c, cp, new_ll}
+            else
+              do_process(rest, prefix, delim, max_keys, new_c, cp, new_ll, nil, key)
+            end
+
+          {:cp, cp_str} ->
+            new_cp = [cp_str | cp]
+            new_ll = upper_bound(cp_str) || cp_str <> <<0xFF>>
+
+            if length(c) + length(new_cp) >= max_keys do
+              {:hit_max, c, new_cp, new_ll}
+            else
+              do_process(rest, prefix, delim, max_keys, c, new_cp, new_ll, cp_str, key)
+            end
+        end
+    end
+  end
+
+  defp classify(_key, _prefix, nil), do: :content
+
+  defp classify(key, prefix, delim) do
+    rest = binary_part(key, byte_size(prefix), byte_size(key) - byte_size(prefix))
+
+    case :binary.match(rest, delim) do
+      :nomatch ->
+        :content
+
+      {pos, len} ->
+        cp_len = byte_size(prefix) + pos + len
+        {:cp, binary_part(key, 0, cp_len)}
+    end
+  end
+
+  defp fetch_range(state, bucket, lower, nil, limit) do
+    fetch_all(state, :list_open, [bucket, lower, limit])
+  end
+
+  defp fetch_range(state, bucket, lower, upper, limit) do
+    fetch_all(state, :list_range, [bucket, lower, upper, limit])
+  end
 end

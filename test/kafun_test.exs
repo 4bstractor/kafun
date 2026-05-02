@@ -66,8 +66,10 @@ defmodule KafunTest do
         S3XML.list_objects(
           "imouto",
           "",
+          nil,
           1000,
           [%{key: "a", size: 1, etag: "x", mtime: 0}],
+          [],
           true,
           "a"
         )
@@ -76,6 +78,26 @@ defmodule KafunTest do
       assert xml =~ "<IsTruncated>true</IsTruncated>"
       assert xml =~ "<NextContinuationToken>"
       assert xml =~ "<ETag>\"x\"</ETag>"
+    end
+
+    test "list_objects renders common prefixes when delimiter set" do
+      xml =
+        S3XML.list_objects(
+          "imouto",
+          "",
+          "/",
+          1000,
+          [],
+          ["a/", "b/"],
+          false,
+          nil
+        )
+        |> IO.iodata_to_binary()
+
+      assert xml =~ "<Delimiter>/</Delimiter>"
+      assert xml =~ "<CommonPrefixes><Prefix>a/</Prefix></CommonPrefixes>"
+      assert xml =~ "<CommonPrefixes><Prefix>b/</Prefix></CommonPrefixes>"
+      assert xml =~ "<KeyCount>2</KeyCount>"
     end
 
     test "error escapes the resource" do
@@ -109,17 +131,60 @@ defmodule KafunTest do
         :ok = Index.put("b", k, 1, "e", nil, 0)
       end
 
-      {entries, false, nil} = Index.list("b", prefix: "b/", max_keys: 10)
+      {entries, [], false, nil} = Index.list("b", prefix: "b/", max_keys: 10)
       assert Enum.map(entries, & &1.key) == ["b/1", "b/2", "b/3"]
 
-      {first_page, true, next} = Index.list("b", prefix: "b/", max_keys: 2)
+      {first_page, [], true, next} = Index.list("b", prefix: "b/", max_keys: 2)
       assert Enum.map(first_page, & &1.key) == ["b/1", "b/2"]
-      assert next == "b/2"
 
-      {second_page, false, nil} =
-        Index.list("b", prefix: "b/", max_keys: 2, start_after: next)
+      {second_page, [], false, nil} =
+        Index.list("b", prefix: "b/", max_keys: 2, continuation: next)
 
       assert Enum.map(second_page, & &1.key) == ["b/3"]
+    end
+
+    test "list with delimiter rolls keys into common prefixes" do
+      for k <- ["a/1", "a/2", "a/sub/1", "b/1", "top.txt"] do
+        :ok = Index.put("d", k, 1, "e", nil, 0)
+      end
+
+      {contents, cps, false, nil} = Index.list("d", delimiter: "/", max_keys: 10)
+      assert Enum.map(contents, & &1.key) == ["top.txt"]
+      assert cps == ["a/", "b/"]
+    end
+
+    test "list with prefix + delimiter walks one tier" do
+      for k <- ["a/", "a/1", "a/2", "a/sub/1", "a/sub/2"] do
+        :ok = Index.put("d", k, 1, "e", nil, 0)
+      end
+
+      {contents, cps, false, nil} =
+        Index.list("d", prefix: "a/", delimiter: "/", max_keys: 10)
+
+      # Note "a/" itself is a content (key starts with prefix, no delimiter after).
+      assert Enum.map(contents, & &1.key) == ["a/", "a/1", "a/2"]
+      assert cps == ["a/sub/"]
+    end
+
+    test "list pagination across common prefixes uses continuation cursor" do
+      for k <- ["a/1", "a/2", "b/1", "b/2", "c/1"] do
+        :ok = Index.put("d", k, 1, "e", nil, 0)
+      end
+
+      {[], [cp1], true, next1} =
+        Index.list("d", delimiter: "/", max_keys: 1)
+
+      assert cp1 == "a/"
+
+      {[], [cp2], true, next2} =
+        Index.list("d", delimiter: "/", max_keys: 1, continuation: next1)
+
+      assert cp2 == "b/"
+
+      {[], [cp3], false, nil} =
+        Index.list("d", delimiter: "/", max_keys: 1, continuation: next2)
+
+      assert cp3 == "c/"
     end
   end
 

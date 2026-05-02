@@ -53,7 +53,9 @@ Attach a handler with `:telemetry.attach_many/4`; nothing is pre-subscribed.
 | GET    | `/healthz`                                    | Liveness, never auth-gated. |
 | GET    | `/`                                           | `ListAllMyBuckets`. |
 | PUT    | `/:bucket`                                    | Idempotent create. |
-| GET    | `/:bucket?list-type=2&...`                    | `ListObjectsV2` — `prefix`, `max-keys`, `start-after`, `continuation-token`. |
+| GET    | `/:bucket?list-type=2&...`                    | `ListObjectsV2` — `prefix`, `delimiter`, `max-keys`, `start-after`, `continuation-token`. |
+| GET    | `/:bucket?uploads`                            | `ListMultipartUploads` — `prefix`, `key-marker`, `upload-id-marker`, `max-uploads`. |
+| GET    | `/:bucket/<key>?uploadId=…`                   | `ListParts` — `part-number-marker`, `max-parts`. |
 | PUT    | `/:bucket/<key>`                              | Streamed upload. ETag = MD5 hex. |
 | POST   | `/:bucket/<key>?uploads`                      | Initiate multipart. Returns `UploadId`. |
 | PUT    | `/:bucket/<key>?partNumber=N&uploadId=…`      | Upload one part. ETag = MD5 of part. |

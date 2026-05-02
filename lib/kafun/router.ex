@@ -50,10 +50,15 @@ defmodule Kafun.Router do
   end
 
   get "/:bucket" do
-    if Storage.valid_bucket?(bucket) do
-      list_objects(conn, bucket)
-    else
-      error(conn, 400, "InvalidBucketName", "bucket name is not valid")
+    cond do
+      not Storage.valid_bucket?(bucket) ->
+        error(conn, 400, "InvalidBucketName", "bucket name is not valid")
+
+      Map.has_key?(conn.query_params, "uploads") ->
+        list_multipart_uploads(conn, bucket)
+
+      true ->
+        list_objects(conn, bucket)
     end
   end
 
@@ -68,7 +73,7 @@ defmodule Kafun.Router do
   end
 
   get "/:bucket/*key_parts" do
-    with_object(conn, bucket, key_parts, &do_get/3)
+    with_object(conn, bucket, key_parts, &dispatch_get/3)
   end
 
   match "/:bucket/*key_parts", via: :head do
@@ -137,6 +142,13 @@ defmodule Kafun.Router do
     case conn.query_params["uploadId"] do
       nil -> do_delete(conn, bucket, key)
       uid -> do_abort(conn, uid)
+    end
+  end
+
+  defp dispatch_get(conn, bucket, key) do
+    case conn.query_params["uploadId"] do
+      nil -> do_get(conn, bucket, key)
+      uid -> do_list_parts(conn, bucket, key, uid)
     end
   end
 
@@ -336,29 +348,111 @@ defmodule Kafun.Router do
     qs = conn.query_params
 
     prefix = Map.get(qs, "prefix", "")
+    delimiter = Map.get(qs, "delimiter")
     max_keys = qs |> Map.get("max-keys", "1000") |> safe_int(1000)
 
-    start_after =
+    base_opts = [
+      prefix: prefix,
+      delimiter: delimiter,
+      max_keys: max_keys
+    ]
+
+    cursor_opts =
       cond do
-        token = Map.get(qs, "continuation-token") -> S3XML.token_decode(token)
-        s = Map.get(qs, "start-after") -> s
-        true -> ""
+        token = Map.get(qs, "continuation-token") ->
+          [continuation: S3XML.token_decode(token)]
+
+        s = Map.get(qs, "start-after") ->
+          [start_after: s]
+
+        true ->
+          []
       end
 
-    {entries, truncated?, next} =
-      Index.list(bucket, prefix: prefix, start_after: start_after, max_keys: max_keys)
+    {entries, common_prefixes, truncated?, next} =
+      Index.list(bucket, base_opts ++ cursor_opts)
 
     emit(
       [:list, :stop],
       %{
-        count: length(entries),
+        count: length(entries) + length(common_prefixes),
         duration: System.monotonic_time(:microsecond) - started
       },
       %{bucket: bucket, prefix: prefix, truncated: truncated?}
     )
 
-    body = S3XML.list_objects(bucket, prefix, max_keys, entries, truncated?, next)
+    body =
+      S3XML.list_objects(
+        bucket,
+        prefix,
+        delimiter,
+        max_keys,
+        entries,
+        common_prefixes,
+        truncated?,
+        next
+      )
+
     send_xml(conn, 200, body)
+  end
+
+  defp list_multipart_uploads(conn, bucket) do
+    qs = conn.query_params
+
+    prefix = Map.get(qs, "prefix", "")
+    key_marker = Map.get(qs, "key-marker", "")
+    upload_id_marker = Map.get(qs, "upload-id-marker", "")
+    max_uploads = qs |> Map.get("max-uploads", "1000") |> safe_int(1000)
+
+    {uploads, truncated?, next_key, next_uid} =
+      Index.list_uploads(bucket,
+        prefix: prefix,
+        key_marker: key_marker,
+        upload_id_marker: upload_id_marker,
+        max_uploads: max_uploads
+      )
+
+    body =
+      S3XML.list_multipart_uploads(
+        bucket,
+        prefix,
+        key_marker,
+        upload_id_marker,
+        max_uploads,
+        uploads,
+        truncated?,
+        next_key,
+        next_uid
+      )
+
+    send_xml(conn, 200, body)
+  end
+
+  defp do_list_parts(conn, bucket, key, upload_id) do
+    case Index.get_upload(upload_id) do
+      :not_found ->
+        error(conn, 404, "NoSuchUpload", upload_id)
+
+      {:ok, %{bucket: ^bucket, key: ^key}} ->
+        qs = conn.query_params
+        marker = qs |> Map.get("part-number-marker", "0") |> safe_int(0)
+        max_parts = qs |> Map.get("max-parts", "1000") |> safe_int(1000)
+
+        {parts, truncated?, next} =
+          Index.list_parts_paged(upload_id,
+            part_number_marker: marker,
+            max_parts: max_parts
+          )
+
+        body =
+          S3XML.list_parts(bucket, key, upload_id, marker, max_parts, parts, truncated?, next)
+
+        send_xml(conn, 200, body)
+
+      {:ok, _other} ->
+        # uploadId is real but doesn't belong to this (bucket, key)
+        error(conn, 404, "NoSuchUpload", upload_id)
+    end
   end
 
   ## Helpers.

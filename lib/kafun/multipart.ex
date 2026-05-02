@@ -30,7 +30,7 @@ defmodule Kafun.Multipart do
 
       {:ok, _} ->
         {:ok, conn, size, etag} = Storage.stream_part_put(conn, root, upload_id, part_number)
-        :ok = Index.record_part(upload_id, part_number, size, etag)
+        :ok = Index.record_part(upload_id, part_number, size, etag, System.system_time(:second))
         {:ok, conn, etag}
     end
   end
