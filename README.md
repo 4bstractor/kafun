@@ -28,16 +28,20 @@ curl 'http://localhost:8333/imouto?list-type=2&prefix=big'
 
 ## Endpoints
 
-| Method | Path                       | What |
-| ------ | -------------------------- | ---- |
-| GET    | `/healthz`                 | Liveness, never auth-gated. |
-| GET    | `/`                        | `ListAllMyBuckets`. |
-| PUT    | `/:bucket`                 | Idempotent create. |
-| GET    | `/:bucket?list-type=2&...` | `ListObjectsV2` — `prefix`, `max-keys`, `start-after`, `continuation-token`. |
-| PUT    | `/:bucket/<key>`           | Streamed upload. ETag = MD5 hex. |
-| GET    | `/:bucket/<key>`           | `Range: bytes=…` honoured (zero-copy `sendfile(2)`). |
-| HEAD   | `/:bucket/<key>`           | Metadata only. |
-| DELETE | `/:bucket/<key>`           | 204. |
+| Method | Path                                          | What |
+| ------ | --------------------------------------------- | ---- |
+| GET    | `/healthz`                                    | Liveness, never auth-gated. |
+| GET    | `/`                                           | `ListAllMyBuckets`. |
+| PUT    | `/:bucket`                                    | Idempotent create. |
+| GET    | `/:bucket?list-type=2&...`                    | `ListObjectsV2` — `prefix`, `max-keys`, `start-after`, `continuation-token`. |
+| PUT    | `/:bucket/<key>`                              | Streamed upload. ETag = MD5 hex. |
+| POST   | `/:bucket/<key>?uploads`                      | Initiate multipart. Returns `UploadId`. |
+| PUT    | `/:bucket/<key>?partNumber=N&uploadId=…`      | Upload one part. ETag = MD5 of part. |
+| POST   | `/:bucket/<key>?uploadId=…`                   | Complete multipart (XML parts list in body). ETag = `md5-of-md5s-N`. |
+| DELETE | `/:bucket/<key>?uploadId=…`                   | Abort multipart. |
+| GET    | `/:bucket/<key>`                              | `Range: bytes=…` honoured (zero-copy `sendfile(2)`). |
+| HEAD   | `/:bucket/<key>`                              | Metadata only. |
+| DELETE | `/:bucket/<key>`                              | 204. |
 
 ## Auth
 

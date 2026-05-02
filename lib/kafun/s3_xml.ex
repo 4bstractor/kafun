@@ -76,6 +76,85 @@ defmodule Kafun.S3XML do
     ]
   end
 
+  @doc "InitiateMultipartUploadResult — body of `POST /:bucket/:key?uploads`."
+  def initiate_multipart(bucket, key, upload_id) do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<InitiateMultipartUploadResult xmlns="#{@ns}">|,
+      "<Bucket>",
+      esc(bucket),
+      "</Bucket>",
+      "<Key>",
+      esc(key),
+      "</Key>",
+      "<UploadId>",
+      esc(upload_id),
+      "</UploadId>",
+      "</InitiateMultipartUploadResult>"
+    ]
+  end
+
+  @doc "CompleteMultipartUploadResult — body of `POST /:bucket/:key?uploadId=…`."
+  def complete_multipart(location, bucket, key, etag) do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<CompleteMultipartUploadResult xmlns="#{@ns}">|,
+      "<Location>",
+      esc(location),
+      "</Location>",
+      "<Bucket>",
+      esc(bucket),
+      "</Bucket>",
+      "<Key>",
+      esc(key),
+      "</Key>",
+      ~s|<ETag>"|,
+      esc(etag),
+      ~s|"</ETag>|,
+      "</CompleteMultipartUploadResult>"
+    ]
+  end
+
+  @doc """
+  Parse a CompleteMultipartUpload request body. Returns a list of
+  `{part_number, etag}` in the order the client provided.
+  """
+  @spec parse_complete_body(String.t()) ::
+          {:ok, [{pos_integer(), String.t()}]} | {:error, atom()}
+  def parse_complete_body(xml) when is_binary(xml) do
+    case Saxy.SimpleForm.parse_string(xml) do
+      {:ok, {"CompleteMultipartUpload", _, children}} ->
+        {:ok, Enum.flat_map(children, &extract_part/1)}
+
+      {:ok, _} ->
+        {:error, :bad_root}
+
+      {:error, _} ->
+        {:error, :invalid_xml}
+    end
+  end
+
+  defp extract_part({"Part", _, kids}) do
+    with {:ok, n_str} <- find_child(kids, "PartNumber"),
+         {:ok, etag} <- find_child(kids, "ETag"),
+         {n, ""} <- Integer.parse(n_str),
+         true <- n in 1..10_000 do
+      [{n, etag}]
+    else
+      _ -> []
+    end
+  end
+
+  defp extract_part(_), do: []
+
+  defp find_child(children, name) do
+    Enum.find(children, &match?({^name, _, _}, &1))
+    |> case do
+      nil -> :not_found
+      {_, _, kids} -> {:ok, kids |> Enum.filter(&is_binary/1) |> IO.iodata_to_binary() |> String.trim()}
+    end
+  end
+
   @doc "Standard S3 error body."
   def error(code, message, resource \\ "") do
     [

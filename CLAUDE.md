@@ -10,10 +10,11 @@ Kafun is an S3-compatible blob service for the homelab. **Elixir / OTP 27 / Band
 
 - `lib/kafun/application.ex` — supervision tree (`Kafun.Index` → `Bandit`)
 - `lib/kafun/router.ex` — Plug.Router; the entire S3 surface lives here
-- `lib/kafun/storage.ex` — filesystem blob ops (path scheme, streaming PUT, Range parsing)
-- `lib/kafun/index.ex` — single-conn SQLite GenServer, prepared statements, `upper_bound/1` for prefix → range
+- `lib/kafun/storage.ex` — filesystem blob ops (path scheme, streaming PUT, Range parsing, multipart concat)
+- `lib/kafun/index.ex` — single-conn SQLite GenServer, prepared statements, `upper_bound/1` for prefix → range, `uploads`/`parts` tables
+- `lib/kafun/multipart.ex` — initiate / upload-part / complete / abort orchestration; computes the `md5-of-md5s-N` ETag
 - `lib/kafun/auth.ex` — SigV4 access-key extraction (header **and** querystring presigned URLs)
-- `lib/kafun/s3_xml.ex` — iolist XML builders for ListAllMyBuckets / ListObjectsV2 / Error
+- `lib/kafun/s3_xml.ex` — iolist builders + a Saxy-backed parser for the CompleteMultipartUpload body
 - `config/runtime.exs` — env-var ingest
 
 ## Run
@@ -40,14 +41,18 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 **Auth.** `Kafun.Auth.access_key/1` parses the access key from either the `Authorization: AWS4-HMAC-SHA256 Credential=…/…` header or the `X-Amz-Credential=` querystring (presigned URLs). Signature is **not** verified — same trusted-network model as the Python original. Empty `KAFUN_KEYS` disables auth entirely. Do not add signature verification without explicit ask.
 
-**Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit; tests `start_supervised!` their own Index pointing at a per-test tmp DB. If you introduce another long-lived process, gate it on the same flag.
+**Multipart.** `POST /:bucket/:key?uploads` initiates and returns an opaque `UploadId` (18 random bytes, url-safe base64). `PUT /:bucket/:key?partNumber=N&uploadId=…` streams the part to `<root>/.uploads/<id>/<n>` with the same temp+rename dance as a regular PUT. `POST /:bucket/:key?uploadId=…` parses the client-supplied parts list (Saxy `SimpleForm.parse_string`), validates each `(partNumber, etag)` against what we recorded, concatenates the parts in client-supplied order into the final blob, and writes the index entry. Final ETag is `md5(decode_hex(part1) || decode_hex(part2) || …)` plus `-N` — the canonical S3 formula. Abort (`DELETE /:bucket/:key?uploadId=…`) just blows away `<root>/.uploads/<id>` and the metadata rows. The two stores are ordered: index commit happens *after* the rename, so a crash mid-Complete leaves an orphan blob and an orphan upload row but never a half-installed index entry. Cleanup is the GC job's problem, not the request path's.
+
+**Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit; tests `start_supervised!` their own Index pointing at a per-test tmp DB. If you introduce another long-lived process, gate it on the same flag. Multipart tests `Application.put_env(:kafun, :root, tmp)` to redirect the storage root.
 
 ## What's deliberately missing
 
-- Multipart upload (no `?uploads`, no `UploadPartCopy`). Add a `parts(upload_id, part_number, bucket, key, size, etag)` table and emit a multipart ETag (`md5-of-md5s-N`).
+- `ListMultipartUploads` (`GET /:bucket?uploads`) and `ListParts` (`GET /:bucket/:key?uploadId=…`) — boto3 doesn't need these for the upload happy path; aws-cli does for `ls --recursive` of in-progress uploads.
+- `UploadPartCopy` (`PUT /:bucket/:key?partNumber=…&uploadId=…` with `x-amz-copy-source`) — server-side range copy for assembling a new object from chunks of an existing one.
 - Delimiter / common-prefixes in ListObjectsV2. Most boto3 callers don't need it; `aws s3 ls s3://bucket/path/` does.
 - Versioning, ACLs, bucket policies, server-side encryption.
 - Content-addressed dedupe. Easy to retrofit: rename the on-disk file to `sha256(body)` and add a refcount in the index. Worth it on a homelab where the same wallpaper / backup tarball ends up in multiple buckets.
+- A GC sweep for orphan blobs / abandoned uploads. Walk `<root>/.uploads/` for dirs older than 24h with no matching `uploads` row → delete; walk shard dirs for files with no matching `objects` row → delete.
 
 ## Migrator
 

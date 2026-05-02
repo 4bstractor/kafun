@@ -53,6 +53,28 @@ defmodule Kafun.Index do
            boolean(), String.t() | nil}
   def list(bucket, opts \\ []), do: GenServer.call(@name, {:list, bucket, opts})
 
+  @spec init_upload(String.t(), String.t(), String.t(), String.t() | nil) :: :ok
+  def init_upload(upload_id, bucket, key, content_type) do
+    GenServer.call(@name, {:init_upload, upload_id, bucket, key, content_type})
+  end
+
+  @spec get_upload(String.t()) ::
+          {:ok, %{bucket: String.t(), key: String.t(), content_type: String.t() | nil}}
+          | :not_found
+  def get_upload(upload_id), do: GenServer.call(@name, {:get_upload, upload_id})
+
+  @spec record_part(String.t(), pos_integer(), non_neg_integer(), String.t()) :: :ok
+  def record_part(upload_id, part_number, size, etag) do
+    GenServer.call(@name, {:record_part, upload_id, part_number, size, etag})
+  end
+
+  @spec list_parts(String.t()) ::
+          [%{part_number: pos_integer(), size: non_neg_integer(), etag: String.t()}]
+  def list_parts(upload_id), do: GenServer.call(@name, {:list_parts, upload_id})
+
+  @spec clear_upload(String.t()) :: :ok
+  def clear_upload(upload_id), do: GenServer.call(@name, {:clear_upload, upload_id})
+
   ## Server
 
   @impl true
@@ -95,6 +117,28 @@ defmodule Kafun.Index do
       ) WITHOUT ROWID
       """)
 
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE TABLE IF NOT EXISTS uploads (
+        upload_id    TEXT PRIMARY KEY,
+        bucket       TEXT NOT NULL,
+        key          TEXT NOT NULL,
+        content_type TEXT,
+        initiated_at INTEGER NOT NULL
+      ) WITHOUT ROWID
+      """)
+
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE TABLE IF NOT EXISTS parts (
+        upload_id   TEXT NOT NULL,
+        part_number INTEGER NOT NULL,
+        size        INTEGER NOT NULL,
+        etag        TEXT NOT NULL,
+        PRIMARY KEY (upload_id, part_number)
+      ) WITHOUT ROWID
+      """)
+
     {:ok, %State{conn: conn, stmts: prepare_all(conn)}}
   end
 
@@ -130,7 +174,30 @@ defmodule Kafun.Index do
         SELECT key, size, etag, mtime FROM objects
         WHERE bucket = ? AND key > ? AND key >= ? AND key < ?
         ORDER BY key LIMIT ?
-        """)
+        """),
+      init_upload:
+        prep(conn, """
+        INSERT INTO uploads (upload_id, bucket, key, content_type, initiated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """),
+      get_upload:
+        prep(conn, """
+        SELECT bucket, key, content_type FROM uploads WHERE upload_id = ?
+        """),
+      record_part:
+        prep(conn, """
+        INSERT INTO parts (upload_id, part_number, size, etag)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (upload_id, part_number) DO UPDATE SET
+          size = excluded.size, etag = excluded.etag
+        """),
+      list_parts:
+        prep(conn, """
+        SELECT part_number, size, etag FROM parts
+        WHERE upload_id = ? ORDER BY part_number
+        """),
+      drop_parts: prep(conn, "DELETE FROM parts WHERE upload_id = ?"),
+      drop_upload: prep(conn, "DELETE FROM uploads WHERE upload_id = ?")
     }
   end
 
@@ -208,6 +275,35 @@ defmodule Kafun.Index do
 
     next = if truncated, do: List.last(out).key, else: nil
     {:reply, {out, truncated, next}, state}
+  end
+
+  def handle_call({:init_upload, id, b, k, ct}, _from, state) do
+    run(state, :init_upload, [id, b, k, ct, System.system_time(:second)])
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:get_upload, id}, _from, state) do
+    case fetch_one(state, :get_upload, [id]) do
+      [b, k, ct] -> {:reply, {:ok, %{bucket: b, key: k, content_type: ct}}, state}
+      nil -> {:reply, :not_found, state}
+    end
+  end
+
+  def handle_call({:record_part, id, n, sz, etag}, _from, state) do
+    run(state, :record_part, [id, n, sz, etag])
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:list_parts, id}, _from, state) do
+    rows = fetch_all(state, :list_parts, [id])
+    out = Enum.map(rows, fn [n, sz, etag] -> %{part_number: n, size: sz, etag: etag} end)
+    {:reply, out, state}
+  end
+
+  def handle_call({:clear_upload, id}, _from, state) do
+    run(state, :drop_parts, [id])
+    run(state, :drop_upload, [id])
+    {:reply, :ok, state}
   end
 
   @impl true

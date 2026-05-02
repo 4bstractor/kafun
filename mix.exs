@@ -24,6 +24,7 @@ defmodule Kafun.MixProject do
       {:bandit, "~> 1.6"},
       {:plug, "~> 1.16"},
       {:exqlite, "~> 0.27"},
+      {:saxy, "~> 1.5"},
       {:telemetry, "~> 1.3"}
     ]
   end

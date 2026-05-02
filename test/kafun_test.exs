@@ -1,7 +1,7 @@
 defmodule KafunTest do
   use ExUnit.Case, async: false
 
-  alias Kafun.{Index, Storage, S3XML}
+  alias Kafun.{Index, Multipart, Storage, S3XML}
 
   describe "Storage.parse_range/2" do
     test "absent / empty returns :none" do
@@ -121,5 +121,103 @@ defmodule KafunTest do
 
       assert Enum.map(second_page, & &1.key) == ["b/3"]
     end
+  end
+
+  describe "S3XML.parse_complete_body/1" do
+    test "parses parts in client order" do
+      xml = """
+      <?xml version="1.0" encoding="UTF-8"?>
+      <CompleteMultipartUpload>
+        <Part><PartNumber>2</PartNumber><ETag>"bbb"</ETag></Part>
+        <Part><PartNumber>1</PartNumber><ETag>"aaa"</ETag></Part>
+      </CompleteMultipartUpload>
+      """
+
+      assert {:ok, [{2, "\"bbb\""}, {1, "\"aaa\""}]} = S3XML.parse_complete_body(xml)
+    end
+
+    test "rejects non-CMU root" do
+      assert {:error, :bad_root} = S3XML.parse_complete_body("<Foo/>")
+    end
+
+    test "rejects malformed xml" do
+      assert {:error, :invalid_xml} = S3XML.parse_complete_body("<Foo><Bar")
+    end
+  end
+
+  describe "Multipart.multipart_etag/1" do
+    test "matches the canonical S3 formula" do
+      # Two parts, each MD5 of "hello" (5d41402abc4b2a76b9719d911017c592).
+      etag = Multipart.multipart_etag([{1, "5d41402abc4b2a76b9719d911017c592"},
+                                       {2, "5d41402abc4b2a76b9719d911017c592"}])
+
+      # md5(decode_hex(e1) || decode_hex(e2)) followed by "-2".
+      bin = :binary.decode_hex("5d41402abc4b2a76b9719d911017c592") |> :binary.copy(2)
+      expected = :crypto.hash(:md5, bin) |> Base.encode16(case: :lower)
+      assert etag == "#{expected}-2"
+    end
+  end
+
+  describe "Multipart end-to-end" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-mp-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      %{root: tmp}
+    end
+
+    test "initiate -> upload parts -> complete reassembles in order", %{root: root} do
+      {:ok, upload_id} = Multipart.initiate("b", "blob", "application/octet-stream")
+
+      part1 = :binary.copy(<<0xAA>>, 1024)
+      part2 = :binary.copy(<<0xBB>>, 512)
+
+      {conn1, _} = put_part_conn(part1)
+      {:ok, _, etag1} = Multipart.upload_part(conn1, root, upload_id, 1)
+
+      {conn2, _} = put_part_conn(part2)
+      {:ok, _, etag2} = Multipart.upload_part(conn2, root, upload_id, 2)
+
+      {:ok, %{etag: etag, size: size, bucket: "b", key: "blob"}} =
+        Multipart.complete(root, upload_id, [{1, etag1}, {2, etag2}])
+
+      assert size == 1536
+      assert etag =~ ~r/^[a-f0-9]{32}-2$/
+
+      blob = Storage.blob_path(root, "b", "blob") |> File.read!()
+      assert blob == part1 <> part2
+      assert {:ok, %{size: 1536, etag: ^etag}} = Index.get("b", "blob")
+
+      # Upload temp dir cleaned up.
+      refute File.exists?(Storage.uploads_dir(root, upload_id))
+    end
+
+    test "abort cleans up parts and metadata", %{root: root} do
+      {:ok, upload_id} = Multipart.initiate("b", "blob", nil)
+      {conn, _} = put_part_conn(:binary.copy(<<1>>, 100))
+      {:ok, _, _} = Multipart.upload_part(conn, root, upload_id, 1)
+
+      assert File.exists?(Storage.uploads_dir(root, upload_id))
+      assert :ok = Multipart.abort(root, upload_id)
+      refute File.exists?(Storage.uploads_dir(root, upload_id))
+      assert :not_found = Index.get_upload(upload_id)
+    end
+
+    test "complete rejects mismatched etag", %{root: root} do
+      {:ok, upload_id} = Multipart.initiate("b", "blob", nil)
+      {conn, _} = put_part_conn(<<1, 2, 3>>)
+      {:ok, _, _real_etag} = Multipart.upload_part(conn, root, upload_id, 1)
+
+      assert {:error, {:part_mismatch, 1}} =
+               Multipart.complete(root, upload_id, [{1, "deadbeef"}])
+    end
+  end
+
+  defp put_part_conn(body) do
+    conn = Plug.Test.conn(:put, "/x", body)
+    {conn, body}
   end
 end

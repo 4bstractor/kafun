@@ -15,12 +15,15 @@ defmodule Kafun.Router do
   use Plug.Router
   require Logger
 
-  alias Kafun.{Auth, Index, S3XML, Storage}
+  alias Kafun.{Auth, Index, Multipart, S3XML, Storage}
 
   plug Plug.Logger, log: :debug
+  plug :fetch_qs
   plug :match
   plug :authenticate
   plug :dispatch
+
+  defp fetch_qs(conn, _), do: Plug.Conn.fetch_query_params(conn)
 
   ## Health — never auth-gated.
 
@@ -56,8 +59,12 @@ defmodule Kafun.Router do
 
   ## Object-level.
 
+  post "/:bucket/*key_parts" do
+    with_object(conn, bucket, key_parts, &dispatch_post/3)
+  end
+
   put "/:bucket/*key_parts" do
-    with_object(conn, bucket, key_parts, &do_put/3)
+    with_object(conn, bucket, key_parts, &dispatch_put/3)
   end
 
   get "/:bucket/*key_parts" do
@@ -69,7 +76,7 @@ defmodule Kafun.Router do
   end
 
   delete "/:bucket/*key_parts" do
-    with_object(conn, bucket, key_parts, &do_delete/3)
+    with_object(conn, bucket, key_parts, &dispatch_delete/3)
   end
 
   match _ do
@@ -97,6 +104,114 @@ defmodule Kafun.Router do
           |> halt()
       end
     end
+  end
+
+  ## Method dispatchers — branch on multipart query params.
+
+  defp dispatch_post(conn, bucket, key) do
+    qs = conn.query_params
+
+    cond do
+      Map.has_key?(qs, "uploads") -> do_initiate(conn, bucket, key)
+      uid = qs["uploadId"] -> do_complete(conn, bucket, key, uid)
+      true -> error(conn, 400, "InvalidRequest", "POST requires ?uploads or ?uploadId=…")
+    end
+  end
+
+  defp dispatch_put(conn, bucket, key) do
+    qs = conn.query_params
+
+    case {qs["uploadId"], qs["partNumber"]} do
+      {uid, n_str} when is_binary(uid) and is_binary(n_str) ->
+        do_upload_part(conn, uid, n_str)
+
+      {nil, nil} ->
+        do_put(conn, bucket, key)
+
+      _ ->
+        error(conn, 400, "InvalidArgument", "uploadId and partNumber must be provided together")
+    end
+  end
+
+  defp dispatch_delete(conn, bucket, key) do
+    case conn.query_params["uploadId"] do
+      nil -> do_delete(conn, bucket, key)
+      uid -> do_abort(conn, uid)
+    end
+  end
+
+  ## Multipart handlers.
+
+  defp do_initiate(conn, bucket, key) do
+    {:ok, upload_id} = Multipart.initiate(bucket, key, first_header(conn, "content-type"))
+    send_xml(conn, 200, S3XML.initiate_multipart(bucket, key, upload_id))
+  end
+
+  defp do_upload_part(conn, upload_id, part_number_str) do
+    case Integer.parse(part_number_str) do
+      {n, ""} when n in 1..10_000 ->
+        case Multipart.upload_part(conn, root(), upload_id, n) do
+          {:ok, conn, etag} ->
+            conn
+            |> put_resp_header("etag", ~s|"#{etag}"|)
+            |> send_resp(200, "")
+
+          {:error, :no_such_upload} ->
+            error(conn, 404, "NoSuchUpload", upload_id)
+        end
+
+      _ ->
+        error(conn, 400, "InvalidArgument", "partNumber must be 1..10000")
+    end
+  end
+
+  defp do_complete(conn, bucket, key, upload_id) do
+    {:ok, body, conn} = Plug.Conn.read_body(conn, length: 5_000_000)
+
+    with {:ok, parts} <- S3XML.parse_complete_body(body),
+         {:ok, %{etag: etag}} <- Multipart.complete(root(), upload_id, parts) do
+      location = build_location(conn, bucket, key)
+      send_xml(conn, 200, S3XML.complete_multipart(location, bucket, key, etag))
+    else
+      {:error, :no_such_upload} ->
+        error(conn, 404, "NoSuchUpload", upload_id)
+
+      {:error, :no_parts} ->
+        error(conn, 400, "MalformedXML", "no parts in CompleteMultipartUpload body")
+
+      {:error, {:missing_part, n}} ->
+        error(conn, 400, "InvalidPart", "part #{n} not uploaded")
+
+      {:error, {:part_mismatch, n}} ->
+        error(conn, 400, "InvalidPart", "etag for part #{n} does not match")
+
+      {:error, :invalid_xml} ->
+        error(conn, 400, "MalformedXML", "could not parse CompleteMultipartUpload body")
+
+      {:error, :bad_root} ->
+        error(conn, 400, "MalformedXML", "expected <CompleteMultipartUpload>")
+    end
+  end
+
+  defp do_abort(conn, upload_id) do
+    case Multipart.abort(root(), upload_id) do
+      :ok -> send_resp(conn, 204, "")
+      {:error, :no_such_upload} -> error(conn, 404, "NoSuchUpload", upload_id)
+    end
+  end
+
+  defp build_location(conn, bucket, key) do
+    scheme = if conn.scheme == :https, do: "https", else: "http"
+    host = conn.host
+
+    port =
+      case {scheme, conn.port} do
+        {"http", 80} -> ""
+        {"https", 443} -> ""
+        {_, p} -> ":#{p}"
+      end
+
+    "#{scheme}://#{host}#{port}/#{bucket}/#{key}"
   end
 
   ## Object handlers.
@@ -165,7 +280,6 @@ defmodule Kafun.Router do
   ## ListObjectsV2.
 
   defp list_objects(conn, bucket) do
-    conn = Plug.Conn.fetch_query_params(conn)
     qs = conn.query_params
 
     prefix = Map.get(qs, "prefix", "")
