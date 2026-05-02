@@ -49,9 +49,19 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 **Streaming PUT.** `Storage.stream_put/4` and `stream_part_put/4` share an inner `stream_to_disk/2` helper: open `<final>.tmp.<rand>`, drain `Plug.Conn.read_body` in 64 KiB chunks, hash MD5 inline, then `:file.rename` to publish. ETag is the canonical S3 single-part value (hex MD5). Multi-GB PUTs never materialize in memory.
 
-**Listing.** Prefix queries are converted to a half-open byte range via `Index.upper_bound/1` (rightmost-non-`0xFF` byte +1, carrying through trailing `0xFF`s). Delimiter / common-prefixes is implemented as a multi-page scanner in `Index.scan_loop/11`: classify each row as `:content` or `{:cp, prefix}`; when emitting a CP, set `in_cp` to skip subsequent rows starting with it, and the next-page lower bound becomes `upper_bound(cp)` so a re-query naturally jumps the whole subtree. Cursors are `>=` (inclusive) — the continuation token is `Base.url_encode64(lower_bound)`. `start-after` from S3 callers maps to `key <> <<0>>` so we keep one SQL shape. After hitting `max_keys`, a 1-row peek confirms whether truncation is real (avoids the trailing-empty-page footgun).
+**aws-chunked unwrap.** Modern boto3 (≥1.36) and aws-cli send PUT bodies as `Content-Encoding: aws-chunked` with `x-amz-content-sha256: STREAMING-…` and an optional CRC32 trailer. The wire body is `<hex-size>[;chunk-signature=…]\r\n<data>\r\n` repeated, terminated by `0\r\n[trailers]\r\n`. `Storage.aws_chunked?/1` detects this from headers, and `Storage.consume_chunked/6` is a streaming state machine (`:size_line | {:data, n} | :data_crlf | :trailer`) that reads the wire body in 64 KiB pulls, writes only the data segments to disk, and discards extensions and trailers. ETag is computed over the unwrapped bytes. The same unwrap covers `stream_put` and `stream_part_put` because both go through `stream_to_disk`. Without this, every byte of chunk overhead lands in the stored object — a silent +N corruption.
+
+**Listing.** Prefix queries are converted to a half-open byte range via `Index.upper_bound/1` (rightmost-non-`0xFF` byte +1, carrying through trailing `0xFF`s). Delimiter / common-prefixes is implemented as a multi-page scanner in `Index.scan_loop/11`: classify each row as `:content` or `{:cp, prefix}`; when emitting a CP, set `in_cp` to skip subsequent rows starting with it, and the next-page lower bound becomes `upper_bound(cp)` so a re-query naturally jumps the whole subtree. Cursors are `>=` (inclusive) — the continuation token is `Base.url_encode64(lower_bound)`. `start-after` from S3 callers maps to `key <> <<0>>` so we keep one SQL shape. After hitting `max_keys`, a 1-row peek confirms whether truncation is real (avoids the trailing-empty-page footgun). When clients pass both `continuation-token` and `start-after`, CT wins (S3 spec). `encoding-type=url` is echoed in the response and URL-encodes `<Key>`, `<Prefix>`, `<Delimiter>`, and `<CommonPrefixes>`. `fetch-owner=true` emits a fixed `<Owner><ID>kafun</ID><DisplayName>kafun</DisplayName></Owner>` block on `<Contents>` (we don't model per-object ownership).
 
 **Multipart.** `POST /:bucket/:key?uploads` initiates and returns an opaque `UploadId` (18 random bytes, url-safe base64). `PUT /:bucket/:key?partNumber=N&uploadId=…` streams the part to `<root>/.uploads/<id>/<n>` with the same temp+rename dance. `POST /:bucket/:key?uploadId=…` parses the client-supplied parts list (Saxy `SimpleForm.parse_string`), validates each `(partNumber, etag)` against what we recorded, concatenates in client-supplied order into the final blob, and writes the index entry. Final ETag is `md5(decode_hex(part1) || …)` plus `-N`. The two stores are ordered: index commit happens *after* the rename, so a crash mid-Complete leaves an orphan blob and orphan upload row but never a half-installed index entry. Cleanup is the GC's job, not the request path's. Multipart listing (`?uploads`, `?uploadId=…`) is paginated by `(key, upload_id)` and `partNumber` markers respectively.
+
+**Server-side copy.** `PUT` with `x-amz-copy-source: /srcBucket/srcKey` triggers `Storage.copy_blob/5` — a `:file.copy/3` between the sharded paths under the same temp+rename discipline. The destination inherits the source's ETag and content-type from the index (bytes are identical, no rehash). `UploadPartCopy` (the same header on a part-PUT) goes through `Storage.copy_part/6`, which honours `x-amz-copy-source-range: bytes=A-B` by `:file.position/2`-seeking the source FD before streaming exactly that window into the part slot, computing MD5 inline. Source paths in the header may be URL-encoded and may carry a `?versionId=…` suffix (we strip it — versioning is out of scope). Both flavours surface `NoSuchKey`/`NoSuchBucket`/`NoSuchUpload` per S3 semantics; mid-route races (index says yes, blob already gone) also fall through to `NoSuchKey`.
+
+**Multi-Object Delete.** `POST /:bucket?delete` with a `<Delete><Object><Key>…</Key></Object>…[<Quiet>true</Quiet>]</Delete>` body (Saxy parsed via `S3XML.parse_delete_body/1`). Up to 1000 keys per request; body capped at 1 MiB. Each key is run through `Storage.valid_key?/1` and reported as either `<Deleted>` (always idempotent — deleting a non-existent key is a no-op success) or `<Error Code="InvalidKey">`. Quiet mode suppresses `<Deleted>` blocks but always emits `<Error>`. Status is always 200 even on per-key errors; clients dispatch on the response body. Telemetry: `[:kafun, :delete_objects, :stop]` with `:count`, `:deleted`, `:errors`, `:duration`.
+
+**Bucket existence gating.** `Index.bucket_exists?/1` is a prepared `SELECT 1 FROM buckets WHERE name = ? LIMIT 1` and runs in `with_object/4`, the bucket-level `GET`, the bucket-level `POST ?delete`, and `HEAD /:bucket`. Operations against a never-created bucket return `404 NoSuchBucket` instead of silently empty results or auto-creating. CreateBucket (`PUT /:bucket`) is the only path that still calls `Index.ensure_bucket/1`. Note: `Index.put/6` *also* still calls `ensure_bucket_inline` — that's intentional so direct API callers in tests work, but the router always passes through the existence guard before reaching it.
+
+**Request id.** `:stamp_request` plug is the second plug in the pipeline (right after `Plug.Logger`). Each request gets a `:crypto.strong_rand_bytes(8)` upper-hex id assigned to `conn.assigns[:request_id]` and emitted as `x-amz-request-id` on every response. The same id is carried into `<RequestId>` and `<HostId>` of error XML bodies (we don't differentiate the two; real S3 has two distinct values for AWS-internal tracing, irrelevant here). The `error/4` helper detects `conn.method == "HEAD"` and emits empty body + `x-amz-error-code: <Code>` header instead of the XML body — HEAD has no body to carry the code, so the header is the only signal.
 
 **Index concurrency.** One GenServer owns the SQLite handle and serializes both reads and writes. WAL is on, but we don't exploit it — every call queues. For homelab volumes this is fine; if it becomes a bottleneck, the upgrade path is a `NimblePool` of read connections (writes still through the GenServer to keep `INSERT OR REPLACE` race-free). Two indexes were added beyond the implicit PKs: `uploads(bucket, key, upload_id)` for ListMultipartUploads and `uploads(initiated_at)` for the GC abandoned-upload query. The `parts.mtime` column is added via an idempotent `ALTER TABLE` migration in `Index.init/1`.
 
@@ -64,46 +74,52 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 **Auth.** `Kafun.Auth.access_key/1` extracts the access key from either the `Authorization: AWS4-HMAC-SHA256 Credential=…/…` header or the `X-Amz-Credential=` querystring (presigned URLs). Signature is **not** verified — same trusted-network model as the Python original. Empty `KAFUN_KEYS` disables auth entirely. **Do not add signature verification without explicit ask.**
 
-**Path traversal protection.** `Storage.valid_key?/1` rejects empty / >1024-byte keys, control bytes (`\0\n\r`), keys starting with `/`, and any key whose `Path.split/1` contains a `.` or `..` segment. This matters because the on-disk layout uses the raw key as the leaf filename — without validation, a key like `"../../../../tmp/pwned"` would write to `/tmp/pwned` after traversing out of `<root>/<bucket>/<aa>/<bb>/`. The validator runs in the router's `with_object/4` wrapper, so every object-level handler is gated.
+**Path traversal protection.** `Storage.valid_key?/1` rejects empty / >1024-byte keys, control bytes (`\0\n\r`), keys starting with `/`, and any key whose `Path.split/1` contains a `.` or `..` segment. This matters because the on-disk layout uses the raw key as the leaf filename — without validation, a key like `"../../../../tmp/pwned"` would write to `/tmp/pwned` after traversing out of `<root>/<bucket>/<aa>/<bb>/`. The validator runs in the router's `with_object/4` wrapper alongside the bucket-existence check, so every object-level handler is gated. Same validator also gates each key inside `DeleteObjects` so a batch delete can't smuggle an `../escape`.
 
 **Telemetry.** Every handler emits one terminal `[:kafun, <op>, :stop]` event with `:duration` (μs) and `:size` where applicable. Multipart family: `[:kafun, :multipart, :initiate | :upload_part | :complete | :abort]`. GC: `[:kafun, :gc, :run]`. Metadata always carries `:bucket` and `:key` for object ops (or `:upload_id` for multipart). Nothing pre-attaches — consumers call `:telemetry.attach_many/4`. Adding a new event is one line via the router's `emit/3` helper.
 
 **Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit/GC. Tests `start_supervised!` their own Index pointing at a per-test tmp DB and start GC with `interval_ms: 0` to disable the tick. Multipart tests `Application.put_env(:kafun, :root, tmp)` to redirect the storage root. If you introduce another long-lived process, gate it on the same flag.
 
+## What's left for S3 parity
+
+Done so far: ListAllMyBuckets, CreateBucket, HeadBucket, ListObjectsV2 (delimiter / pagination / encoding-type / fetch-owner), PutObject, GetObject (with Range), HeadObject, DeleteObject, multipart Initiate/UploadPart/Complete/Abort/ListMultipartUploads/ListParts, CopyObject, UploadPartCopy, DeleteObjects (multi-delete), aws-chunked unwrap, NoSuchBucket gating, x-amz-request-id + error RequestId/HostId, x-amz-error-code on HEAD 404. End-to-end verified against real boto3 (990-image migration) and via curl wire tests.
+
+### Tier 1 — gaps that block daily aws-cli flow
+
+- **DeleteBucket** (`DELETE /:bucket`). Required for `aws s3 rb`. Implementation is one prepared statement (`DELETE FROM buckets WHERE name = ?`), an `rmdir` of the bucket dir on disk if empty, and per-spec a `BucketNotEmpty` error when `objects` still has rows. `--force` is implemented client-side (it's just ListObjectsV2 + DeleteObjects + DeleteBucket).
+- **Conditional headers** on PUT/GET/HEAD/CopyObject: `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, plus the copy-side `x-amz-copy-source-if-*` variants. `aws s3 sync` uses these to skip unchanged files; without them, sync re-PUTs everything every run.
+- **User metadata** (`x-amz-meta-*`). Currently dropped on PUT and never echoed back on GET/HEAD. Need a `meta` blob column on `objects` (json or query-string-encoded) and round-trip through Index.put / Index.get and the response header builders.
+- **Stub bucket sub-resources** — `GET /:bucket?location|acl|policy|versioning|cors|lifecycle|tagging`. We currently treat unknown query params as ListObjectsV2, which returns a list of objects to clients that asked for a config document — confusing. A handful of empty/200 stubs (or proper 404 NoSuchBucketPolicy / NoSuchTagSet error codes) avoids client-side fallout. `?location` is the most common — boto3 calls it on `head_bucket` follow-ups.
+
+### Tier 2 — nice-to-haves with realistic clients
+
+- **CopyObject metadata-directive=REPLACE** plus `x-amz-meta-*` on the copy. Lets clients change content-type or user metadata via a copy-to-self. Implementation depends on Tier-1 user-metadata work.
+- **Multi-range GET** (`Range: bytes=0-100,200-300`) returning `multipart/byteranges`. Single-range only today. aws-cli doesn't issue these; some video tooling does.
+- **`x-amz-bucket-region` header on HeadBucket success.** Real S3 emits this so clients can route cross-region. Single fixed value (`us-east-1`) here.
+- **List-buckets pagination.** S3 caps at 1000 buckets per page; we don't paginate. Real homelab user is unlikely to hit this.
+
+### Tier 3 — explicitly out of scope unless asked
+
+- **Versioning, ACLs, bucket policies, IAM, server-side encryption (SSE-S3/KMS/C), object lock, replication, lifecycle rules, inventory, intelligent-tiering, CORS, website hosting.** Deferred — homelab trusted-network model doesn't need them. If implemented later, most are stub responses; only versioning would touch the index schema.
+- **SigV4 signature verification.** Same trusted-network policy. **Do not add without explicit ask.**
+
+### Other known unknowns
+
+- **Header case.** Bandit lowercases response headers; aws-cli/boto3 are tolerant, hand-rolled SigV4 clients may not be. No known incident.
+- **Strict prefix-cursor on degenerate `0xFF` keys.** The all-`0xFF` prefix branch in `list_uploads` falls back to a non-prefix-bounded scan and is approximate. Affects literally no real key.
+- **Read-connection pool.** Defer until profiling actually says the single-GenServer is the bottleneck. NimblePool with N read conns + the existing writer is the path.
+- **Content-addressed dedupe.** Rename on-disk file to `sha256(body)` and add a refcount column. Worth it on a homelab where the same backup tarball lands in multiple buckets.
+- **Hash-named on-disk files.** Defense in depth beyond the validator — store as `<root>/<bucket>/<aa>/<bb>/<sha256(key)>`. Trades human-readable filenames for one fewer attack surface. The validator is doing the job today.
+
 ## Roadmap
 
-What's left, roughly in order:
+### 1. Tier-1 parity (next)
+DeleteBucket, conditional headers, user metadata, stub sub-resources. After these, `aws s3 sync` and `aws s3 rb` work cleanly and unknown bucket sub-resource queries don't return lists of objects.
 
-### 1. AWS CLI shakedown (next)
-Run `aws s3` and `aws s3api` against a real LAN deployment, find wire-format quirks not covered by boto3 (XML element ordering, error-code expectations, edge cases). Likely fallout: header capitalization, `<Owner>` shape on `Contents`, missing `<EncodingType>` echo, possibly `<ResponseMetadata>` differences.
-
-### 2. CopyObject / UploadPartCopy
-`PUT` with `x-amz-copy-source` header — server-side copy without re-uploading. Two flavors: a fresh object (CopyObject) and a part within an in-flight multipart upload (UploadPartCopy with optional `x-amz-copy-source-range`). For Kafun this is just `:file.copy/3` (or sendfile-to-file if we want zero-copy) plus an index `INSERT OR REPLACE`.
-
-### 3. Phoenix admin UI (last per user direction)
+### 2. Phoenix admin UI (last per user direction)
 Light LiveView app. Probably its own OTP app inside an umbrella (or just a sibling Plug router on a separate port). Pages:
-- Buckets list with object counts and total size (need new aggregation queries on `objects`).
+- Buckets list with object counts and total size (needs new aggregation queries on `objects`).
 - Per-bucket browser with prefix navigation (delimiter listing already does the work).
 - In-flight multipart uploads (`Index.list_uploads/2`) with abort buttons.
 - GC status: last sweep counts, next tick ETA.
 - Telemetry counters live-updated from the existing events.
-
-### Deferred / open questions
-- **Versioning, ACLs, bucket policies, server-side encryption.** Not on the homelab path.
-- **Content-addressed dedupe.** Rename on-disk file to `sha256(body)` and add a refcount column. Worth it on a homelab where the same backup tarball lands in multiple buckets.
-- **Read-connection pool.** Defer until profiling actually says the single-GenServer is the bottleneck. NimblePool with N read conns + the existing writer is the path.
-- **Strict prefix-cursor on degenerate `0xFF` keys.** The all-`0xFF` prefix branch in `list_uploads` falls back to a non-prefix-bounded scan and is approximate. Affects literally no real key.
-- **List-buckets pagination.** S3 caps at 1000; we don't. Adds `<MaxBuckets>`/markers if anyone ever has 1k+ buckets on a homelab.
-- **Hash-named on-disk files.** Defense in depth beyond the validator — store as `<root>/<bucket>/<aa>/<bb>/<sha256(key)>`. Trades human-readable filenames for one fewer attack surface. The validator is doing the job today.
-
-## Known wire-format gaps that the AWS CLI test will likely surface
-
-Calling these out so the test session has a checklist:
-
-- `<EncodingType>` echo on ListObjectsV2 responses — we don't emit it; some clients want it when `encoding-type=url` was requested.
-- Header case — Bandit lowercases response headers; `aws-cli` is generally fine with either, but some SigV4-signing clients expect specific casing on `ETag` / `Content-Length`.
-- `Date` header — Bandit emits `date:` automatically. Some clients require it for SigV4.
-- `<Owner>` element on `<Contents>` is not emitted unless `fetch-owner=true` is requested. We never emit it. aws-cli might complain.
-- Error response `<RequestId>` and `<HostId>` — S3 always returns these; we don't. Some clients may log warnings but should still parse.
-- `HEAD` on non-existent key returns empty 404 — S3 returns specific `x-amz-error-code` headers in this case for HEAD (since there's no XML body). We don't.
-- `aws s3 sync` may use `ListObjectV2` with `start-after` *and* `continuation-token`. We accept either-or, not both. Need to check spec behavior.
