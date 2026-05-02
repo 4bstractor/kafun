@@ -11,10 +11,28 @@ defmodule Kafun.Storage do
   @spec valid_bucket?(String.t()) :: boolean()
   def valid_bucket?(name), do: Regex.match?(@valid_bucket, name)
 
+  @doc """
+  Reject empty / oversize keys, control bytes, and any key whose path
+  resolution could escape the bucket directory. The on-disk layout uses the
+  raw key as the leaf filename, so a key like `"../../../../tmp/pwned"`
+  would otherwise traverse out of `<root>/<bucket>/<aa>/<bb>/`.
+  """
   @spec valid_key?(String.t()) :: boolean()
   def valid_key?(""), do: false
   def valid_key?(key) when byte_size(key) > 1024, do: false
-  def valid_key?(key), do: not String.contains?(key, [<<0>>, "\n", "\r"])
+
+  def valid_key?(key) do
+    cond do
+      String.contains?(key, [<<0>>, "\n", "\r"]) -> false
+      String.starts_with?(key, "/") -> false
+      has_unsafe_segment?(key) -> false
+      true -> true
+    end
+  end
+
+  defp has_unsafe_segment?(key) do
+    Enum.any?(Path.split(key), &(&1 in [".", ".."]))
+  end
 
   @spec blob_path(Path.t(), String.t(), String.t()) :: Path.t()
   def blob_path(root, bucket, key) do
@@ -30,8 +48,21 @@ defmodule Kafun.Storage do
   """
   @spec stream_put(Plug.Conn.t(), Path.t(), String.t(), String.t()) ::
           {:ok, Plug.Conn.t(), non_neg_integer(), String.t()}
-  def stream_put(conn, root, bucket, key) do
-    final = blob_path(root, bucket, key)
+  def stream_put(conn, root, bucket, key),
+    do: stream_to_disk(conn, blob_path(root, bucket, key))
+
+  @doc """
+  Stream a part body to disk. Mirrors `stream_put/4` but writes to the
+  `.uploads/<id>/<n>` slot — the part is held there until the matching
+  CompleteMultipartUpload concatenates it into the final blob.
+  """
+  @spec stream_part_put(Plug.Conn.t(), Path.t(), String.t(), pos_integer()) ::
+          {:ok, Plug.Conn.t(), non_neg_integer(), String.t()}
+  def stream_part_put(conn, root, upload_id, part_number),
+    do: stream_to_disk(conn, part_path(root, upload_id, part_number))
+
+  # Atomic temp+rename write of the streamed request body, with inline MD5.
+  defp stream_to_disk(conn, final) do
     File.mkdir_p!(Path.dirname(final))
     tmp = final <> ".tmp." <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
 
@@ -80,41 +111,16 @@ defmodule Kafun.Storage do
   def uploads_dir(root, upload_id), do: Path.join([root, ".uploads", upload_id])
 
   @doc """
-  Stream a part body to disk. Mirrors `stream_put/4` but writes to the
-  `.uploads/<id>/<n>` slot — the part is held there until the matching
-  CompleteMultipartUpload concatenates it into the final blob.
-  """
-  @spec stream_part_put(Plug.Conn.t(), Path.t(), String.t(), pos_integer()) ::
-          {:ok, Plug.Conn.t(), non_neg_integer(), String.t()}
-  def stream_part_put(conn, root, upload_id, part_number) do
-    final = part_path(root, upload_id, part_number)
-    File.mkdir_p!(Path.dirname(final))
-    tmp = final <> ".tmp." <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
-
-    {:ok, fd} = :file.open(tmp, [:write, :raw, :binary, :delayed_write])
-
-    try do
-      {conn, size, ctx} = consume(conn, fd, 0, :crypto.hash_init(:md5))
-      :ok = :file.close(fd)
-      :ok = :file.rename(tmp, final)
-      etag = ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
-      {:ok, conn, size, etag}
-    rescue
-      e ->
-        _ = :file.close(fd)
-        _ = :file.delete(tmp)
-        reraise e, __STACKTRACE__
-    end
-  end
-
-  @doc """
   Concatenate the listed parts (in order) into the destination blob, atomically.
-  `parts` is `[{part_number, expected_etag}, ...]`. Returns total bytes written
-  and a list of expected-etag bytes (in part order) — caller computes the
-  final multipart ETag from those.
+  `parts` accepts either `pos_integer()` or `{pos_integer(), _ignored}` — the
+  client-supplied etag is *not* used here; caller validates it separately.
+  Returns `{:ok, total_bytes}` or `{:error, {:missing_part, n}}` /
+  `{:error, {:read_error, reason}}` on failure.
   """
-  @spec concat_parts(Path.t(), String.t(), String.t(), String.t(), [{pos_integer(), String.t()}]) ::
-          {:ok, non_neg_integer()} | {:error, atom()}
+  @spec concat_parts(Path.t(), String.t(), String.t(), String.t(),
+                     [pos_integer() | {pos_integer(), term()}]) ::
+          {:ok, non_neg_integer()}
+          | {:error, {:missing_part, pos_integer()} | {:read_error, term()}}
   def concat_parts(root, upload_id, bucket, key, parts) do
     final = blob_path(root, bucket, key)
     File.mkdir_p!(Path.dirname(final))
@@ -124,7 +130,8 @@ defmodule Kafun.Storage do
 
     try do
       total =
-        Enum.reduce(parts, 0, fn {n, _expected}, acc ->
+        Enum.reduce(parts, 0, fn part, acc ->
+          n = part_number(part)
           path = part_path(root, upload_id, n)
 
           case :file.open(path, [:read, :raw, :binary, :read_ahead]) do
@@ -135,8 +142,8 @@ defmodule Kafun.Storage do
                 :file.close(in_fd)
               end
 
-            {:error, reason} ->
-              throw({:missing_part, n, reason})
+            {:error, _reason} ->
+              throw({:missing_part, n})
           end
         end)
 
@@ -149,12 +156,20 @@ defmodule Kafun.Storage do
         _ = :file.delete(tmp)
         reraise e, __STACKTRACE__
     catch
-      {:missing_part, _, _} = e ->
+      {:missing_part, n} ->
         _ = :file.close(out)
         _ = :file.delete(tmp)
-        {:error, elem(e, 0)}
+        {:error, {:missing_part, n}}
+
+      {:read_error, reason} ->
+        _ = :file.close(out)
+        _ = :file.delete(tmp)
+        {:error, {:read_error, reason}}
     end
   end
+
+  defp part_number(n) when is_integer(n), do: n
+  defp part_number({n, _}) when is_integer(n), do: n
 
   defp copy_file(in_fd, out_fd, total \\ 0) do
     case :file.read(in_fd, @chunk) do

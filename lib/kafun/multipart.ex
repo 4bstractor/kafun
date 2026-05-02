@@ -42,7 +42,12 @@ defmodule Kafun.Multipart do
   """
   @spec complete(Path.t(), String.t(), [{pos_integer(), String.t()}]) ::
           {:ok, %{etag: String.t(), size: non_neg_integer(), bucket: String.t(), key: String.t()}}
-          | {:error, :no_such_upload | :no_parts | {:part_mismatch, pos_integer()} | {:missing_part, pos_integer()}}
+          | {:error,
+             :no_such_upload
+             | :no_parts
+             | {:part_mismatch, pos_integer()}
+             | {:missing_part, pos_integer()}
+             | {:read_error, term()}}
   def complete(root, upload_id, requested) do
     with {:ok, upload} <- fetch_upload(upload_id),
          :ok <- ensure_parts(requested),

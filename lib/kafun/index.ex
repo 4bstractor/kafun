@@ -180,6 +180,20 @@ defmodule Kafun.Index do
       {:error, _already_exists} -> :ok
     end
 
+    # Indexes for the multipart-listing and GC paths. PK on `uploads` is
+    # `upload_id` so listing-by-bucket would otherwise scan the whole table.
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE INDEX IF NOT EXISTS uploads_bucket_key
+      ON uploads(bucket, key, upload_id)
+      """)
+
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE INDEX IF NOT EXISTS uploads_initiated_at
+      ON uploads(initiated_at)
+      """)
+
     {:ok, %State{conn: conn, stmts: prepare_all(conn)}}
   end
 

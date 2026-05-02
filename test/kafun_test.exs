@@ -3,6 +3,35 @@ defmodule KafunTest do
 
   alias Kafun.{GC, Index, Multipart, Storage, S3XML}
 
+  describe "Storage.valid_key?/1 — path traversal protection" do
+    test "rejects empty / oversize / control bytes" do
+      refute Storage.valid_key?("")
+      refute Storage.valid_key?(String.duplicate("a", 1025))
+      refute Storage.valid_key?("foo\nbar")
+      refute Storage.valid_key?("foo\rbar")
+      refute Storage.valid_key?("foo" <> <<0>> <> "bar")
+    end
+
+    test "rejects keys that would traverse out of the bucket dir" do
+      refute Storage.valid_key?("../escape")
+      refute Storage.valid_key?("a/../b")
+      refute Storage.valid_key?("foo/../../etc/passwd")
+      refute Storage.valid_key?("./hidden")
+      refute Storage.valid_key?("/abs/path")
+      refute Storage.valid_key?("..")
+      refute Storage.valid_key?(".")
+    end
+
+    test "accepts ordinary keys including dots inside segments" do
+      assert Storage.valid_key?("foo")
+      assert Storage.valid_key?("foo/bar")
+      assert Storage.valid_key?("images/2024/photo.jpg")
+      assert Storage.valid_key?("foo..bar")
+      assert Storage.valid_key?(".hidden-but-not-traversal")
+      assert Storage.valid_key?("a..b/c")
+    end
+  end
+
   describe "Storage.parse_range/2" do
     test "absent / empty returns :none" do
       assert Storage.parse_range(nil, 100) == :none
@@ -278,6 +307,19 @@ defmodule KafunTest do
 
       assert {:error, {:part_mismatch, 1}} =
                Multipart.complete(root, upload_id, [{1, "deadbeef"}])
+    end
+
+    test "concat_parts surfaces missing-part with the part number", %{root: root} do
+      {:ok, upload_id} = Multipart.initiate("b", "blob", nil)
+      {conn, _} = put_part_conn(<<1, 2, 3>>)
+      {:ok, _, etag1} = Multipart.upload_part(conn, root, upload_id, 1)
+
+      # Delete part 1 from disk *after* it's been recorded — simulates a race
+      # where validate_parts saw the row but concat_parts can't open the file.
+      File.rm!(Storage.part_path(root, upload_id, 1))
+
+      assert {:error, {:missing_part, 1}} =
+               Storage.concat_parts(root, upload_id, "b", "blob", [{1, etag1}])
     end
   end
 

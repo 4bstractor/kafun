@@ -29,7 +29,11 @@ defmodule Kafun.GC do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: @name)
 
   @doc "Force a sweep right now. Returns the per-pass counters."
-  @spec run_now() :: %{abandoned: non_neg_integer(), orphans: non_neg_integer()}
+  @spec run_now() :: %{
+          abandoned: non_neg_integer(),
+          orphans: non_neg_integer(),
+          orphan_blobs: non_neg_integer()
+        }
   def run_now, do: GenServer.call(@name, :run_now, 60_000)
 
   @impl true

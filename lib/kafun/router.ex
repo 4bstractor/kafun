@@ -2,14 +2,20 @@ defmodule Kafun.Router do
   @moduledoc """
   S3-compatible HTTP surface. Endpoints:
 
-      GET    /healthz
-      GET    /                          → ListAllMyBuckets
-      PUT    /:bucket                   → CreateBucket
-      GET    /:bucket?list-type=2&...   → ListObjectsV2
-      PUT    /:bucket/<key>             → PutObject       (streamed)
-      GET    /:bucket/<key>             → GetObject       (sendfile + Range)
-      HEAD   /:bucket/<key>             → HeadObject
-      DELETE /:bucket/<key>             → DeleteObject
+      GET    /healthz                              → liveness, never auth-gated
+      GET    /                                     → ListAllMyBuckets
+      PUT    /:bucket                              → CreateBucket
+      GET    /:bucket?list-type=2&prefix=&...      → ListObjectsV2 (delimiter-aware)
+      GET    /:bucket?uploads&...                  → ListMultipartUploads
+      POST   /:bucket/<key>?uploads                → InitiateMultipartUpload
+      POST   /:bucket/<key>?uploadId=…             → CompleteMultipartUpload
+      PUT    /:bucket/<key>                        → PutObject (streamed)
+      PUT    /:bucket/<key>?partNumber=N&uploadId= → UploadPart (streamed)
+      GET    /:bucket/<key>                        → GetObject (sendfile + Range)
+      GET    /:bucket/<key>?uploadId=…             → ListParts
+      HEAD   /:bucket/<key>                        → HeadObject
+      DELETE /:bucket/<key>                        → DeleteObject
+      DELETE /:bucket/<key>?uploadId=…             → AbortMultipartUpload
   """
 
   use Plug.Router
@@ -228,6 +234,9 @@ defmodule Kafun.Router do
 
       {:error, :bad_root} ->
         error(conn, 400, "MalformedXML", "expected <CompleteMultipartUpload>")
+
+      {:error, {:read_error, reason}} ->
+        error(conn, 500, "InternalError", "failed to read part: #{inspect(reason)}")
     end
   end
 
@@ -349,7 +358,7 @@ defmodule Kafun.Router do
 
     prefix = Map.get(qs, "prefix", "")
     delimiter = Map.get(qs, "delimiter")
-    max_keys = qs |> Map.get("max-keys", "1000") |> safe_int(1000)
+    max_keys = qs |> Map.get("max-keys", "1000") |> safe_pos_int(1000)
 
     base_opts = [
       prefix: prefix,
@@ -402,7 +411,7 @@ defmodule Kafun.Router do
     prefix = Map.get(qs, "prefix", "")
     key_marker = Map.get(qs, "key-marker", "")
     upload_id_marker = Map.get(qs, "upload-id-marker", "")
-    max_uploads = qs |> Map.get("max-uploads", "1000") |> safe_int(1000)
+    max_uploads = qs |> Map.get("max-uploads", "1000") |> safe_pos_int(1000)
 
     {uploads, truncated?, next_key, next_uid} =
       Index.list_uploads(bucket,
@@ -435,8 +444,8 @@ defmodule Kafun.Router do
 
       {:ok, %{bucket: ^bucket, key: ^key}} ->
         qs = conn.query_params
-        marker = qs |> Map.get("part-number-marker", "0") |> safe_int(0)
-        max_parts = qs |> Map.get("max-parts", "1000") |> safe_int(1000)
+        marker = qs |> Map.get("part-number-marker", "0") |> safe_nonneg_int(0)
+        max_parts = qs |> Map.get("max-parts", "1000") |> safe_pos_int(1000)
 
         {parts, truncated?, next} =
           Index.list_parts_paged(upload_id,
@@ -511,9 +520,16 @@ defmodule Kafun.Router do
     end
   end
 
-  defp safe_int(s, default) do
+  defp safe_pos_int(s, default) do
     case Integer.parse(s) do
       {n, ""} when n > 0 -> n
+      _ -> default
+    end
+  end
+
+  defp safe_nonneg_int(s, default) do
+    case Integer.parse(s) do
+      {n, ""} when n >= 0 -> n
       _ -> default
     end
   end
