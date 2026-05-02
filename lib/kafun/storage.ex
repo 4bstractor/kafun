@@ -176,6 +176,81 @@ defmodule Kafun.Storage do
     :ok
   end
 
+  ## Blob-tree walking — used by GC.
+
+  @doc """
+  Walks `<root>/<bucket>/<aa>/<bb>/` and returns one tuple per regular file.
+  Skips dot-prefixed top-level dirs (e.g. `.uploads`) and any non-directory
+  entries at root (the SQLite DB lives there).
+
+  Returns `[{bucket, filename, mtime_unix, full_path}]`. `filename` is the raw
+  on-disk name — it may be a `.tmp.<rand>` leftover from a crashed PUT or the
+  actual key.
+  """
+  @spec list_blob_files(Path.t()) :: [
+          {String.t(), String.t(), integer(), Path.t()}
+        ]
+  def list_blob_files(root) do
+    case File.ls(root) do
+      {:ok, names} ->
+        Enum.flat_map(names, fn name ->
+          path = Path.join(root, name)
+
+          if String.starts_with?(name, ".") or not File.dir?(path) do
+            []
+          else
+            list_in_bucket(name, path)
+          end
+        end)
+
+      _ ->
+        []
+    end
+  end
+
+  defp list_in_bucket(bucket, dir) do
+    case File.ls(dir) do
+      {:ok, aas} -> Enum.flat_map(aas, &list_in_aa(bucket, dir, &1))
+      _ -> []
+    end
+  end
+
+  defp list_in_aa(bucket, bucket_dir, aa) do
+    aa_dir = Path.join(bucket_dir, aa)
+
+    if File.dir?(aa_dir) do
+      case File.ls(aa_dir) do
+        {:ok, bbs} -> Enum.flat_map(bbs, &list_in_bb(bucket, aa_dir, &1))
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
+  defp list_in_bb(bucket, aa_dir, bb) do
+    bb_dir = Path.join(aa_dir, bb)
+
+    if File.dir?(bb_dir) do
+      case File.ls(bb_dir) do
+        {:ok, files} ->
+          Enum.flat_map(files, fn f ->
+            path = Path.join(bb_dir, f)
+
+            case File.stat(path, time: :posix) do
+              {:ok, %File.Stat{type: :regular, mtime: mt}} -> [{bucket, f, mt, path}]
+              _ -> []
+            end
+          end)
+
+        _ ->
+          []
+      end
+    else
+      []
+    end
+  end
+
   @doc "Parse a single-range `Range: bytes=A-B` header against `size`."
   @spec parse_range(String.t() | nil, non_neg_integer()) ::
           :none | {:ok, non_neg_integer(), non_neg_integer()} | :invalid

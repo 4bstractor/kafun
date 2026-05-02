@@ -14,6 +14,7 @@ defmodule Kafun.Application do
 
         gc_interval_ms = Application.fetch_env!(:kafun, :gc_interval_ms)
         gc_abandon_after = Application.fetch_env!(:kafun, :gc_abandon_after_seconds)
+        gc_blob_grace = Application.fetch_env!(:kafun, :gc_blob_grace_seconds)
 
         File.mkdir_p!(root)
         Logger.info("kafun starting: root=#{root} db=#{db_path} bind=#{host}:#{port}")
@@ -23,7 +24,8 @@ defmodule Kafun.Application do
           {Kafun.GC,
            root: root,
            interval_ms: gc_interval_ms,
-           abandon_after_seconds: gc_abandon_after},
+           abandon_after_seconds: gc_abandon_after,
+           blob_grace_seconds: gc_blob_grace},
           {Bandit, plug: Kafun.Router, port: port, ip: parse_ip(host)}
         ]
       else

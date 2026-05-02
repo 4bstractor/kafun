@@ -22,7 +22,8 @@ config :kafun,
   port: System.get_env("KAFUN_PORT", "8333") |> String.to_integer(),
   allowed_keys: allowed_keys,
   gc_interval_ms: System.get_env("KAFUN_GC_INTERVAL_SEC", "3600") |> String.to_integer() |> Kernel.*(1000),
-  gc_abandon_after_seconds: System.get_env("KAFUN_GC_ABANDON_AFTER_SEC", "86400") |> String.to_integer()
+  gc_abandon_after_seconds: System.get_env("KAFUN_GC_ABANDON_AFTER_SEC", "86400") |> String.to_integer(),
+  gc_blob_grace_seconds: System.get_env("KAFUN_GC_BLOB_GRACE_SEC", "3600") |> String.to_integer()
 
 if level = System.get_env("KAFUN_LOG_LEVEL") do
   config :logger, level: String.to_atom(level)

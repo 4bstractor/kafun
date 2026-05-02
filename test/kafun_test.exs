@@ -295,7 +295,7 @@ defmodule KafunTest do
       start_supervised!({Index, db_path: db})
 
       start_supervised!(
-        {GC, root: tmp, interval_ms: 0, abandon_after_seconds: 60}
+        {GC, root: tmp, interval_ms: 0, abandon_after_seconds: 60, blob_grace_seconds: 0}
       )
 
       on_exit(fn -> File.rm_rf!(tmp) end)
@@ -327,6 +327,45 @@ defmodule KafunTest do
       assert %{orphans: 1} = GC.run_now()
       refute File.exists?(Storage.uploads_dir(root, orphan))
     end
+
+    test "removes blobs whose objects row is missing", %{root: root} do
+      # Real PUT (blob + index entry).
+      conn = Plug.Test.conn(:put, "/x", "hi")
+      {:ok, _, sz, etag} = Storage.stream_put(conn, root, "imouto", "kept")
+      :ok = Index.put("imouto", "kept", sz, etag, nil, 0)
+
+      # Crashed PUT: blob on disk, no index row.
+      orphan_path = Storage.blob_path(root, "imouto", "lost")
+      File.mkdir_p!(Path.dirname(orphan_path))
+      File.write!(orphan_path, "orphan body")
+
+      # Crashed PUT mid-write: tmp file leftover.
+      tmp_path = orphan_path <> ".tmp.deadbeef"
+      File.write!(tmp_path, "half-written")
+
+      assert %{orphan_blobs: 2} = GC.run_now()
+
+      assert File.exists?(Storage.blob_path(root, "imouto", "kept"))
+      refute File.exists?(orphan_path)
+      refute File.exists?(tmp_path)
+    end
+
+    test "respects blob grace window", %{root: _root} do
+      # Re-supervise GC with a long grace; new blobs should NOT be swept.
+      stop_supervised!(GC)
+      tmp = Application.fetch_env!(:kafun, :root)
+
+      start_supervised!(
+        {GC, root: tmp, interval_ms: 0, abandon_after_seconds: 60, blob_grace_seconds: 3600}
+      )
+
+      orphan_path = Storage.blob_path(tmp, "imouto", "fresh-orphan")
+      File.mkdir_p!(Path.dirname(orphan_path))
+      File.write!(orphan_path, "fresh")
+
+      assert %{orphan_blobs: 0} = GC.run_now()
+      assert File.exists?(orphan_path)
+    end
   end
 
   defp backdate_upload(upload_id, ts) do
@@ -342,7 +381,7 @@ defmodule KafunTest do
       db = Path.join(tmp, "index.db")
       Application.put_env(:kafun, :root, tmp)
       start_supervised!({Index, db_path: db})
-      start_supervised!({GC, root: tmp, interval_ms: 0, abandon_after_seconds: 60})
+      start_supervised!({GC, root: tmp, interval_ms: 0, abandon_after_seconds: 60, blob_grace_seconds: 0})
 
       handler = make_ref()
       test_pid = self()

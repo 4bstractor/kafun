@@ -48,7 +48,7 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 **Telemetry.** Every request handler emits one terminal `[:kafun, <op>, :stop]` event with `:duration` (μs) and `:size` where applicable. Multipart has its own family — `[:kafun, :multipart, :initiate | :upload_part | :complete | :abort]`. GC emits `[:kafun, :gc, :run]` per sweep. Metadata always carries `:bucket` and `:key` for object ops (or `:upload_id` for multipart). To consume: `:telemetry.attach_many/4` against the events you care about; nothing's pre-attached. The router uses a small `emit/3` helper so adding a new event is one line.
 
-**GC.** `Kafun.GC` is a tick-based GenServer in the supervision tree. Each tick runs two passes: (1) `Index.list_abandoned_uploads/1` for `uploads` rows older than `:abandon_after`, calling `Multipart.abort/2` on each; (2) walks `<root>/.uploads/` for subdirs **without** a matching `uploads` row — these are crash-window orphans (rename succeeded, index commit didn't) and get `File.rm_rf`'d. Defaults: 1h interval, 24h abandon-after. Set `KAFUN_GC_INTERVAL_SEC=0` to disable periodic sweeps; `Kafun.GC.run_now/0` works regardless. The blob shard tree is **not** swept yet — that's a future job (walk shards, check each path against the index, delete unreferenced).
+**GC.** `Kafun.GC` is a tick-based GenServer in the supervision tree. Each tick runs three passes: (1) `Index.list_abandoned_uploads/1` for `uploads` rows older than `:abandon_after`, calling `Multipart.abort/2` on each; (2) walks `<root>/.uploads/` for subdirs **without** a matching `uploads` row (crash-window orphans where the index commit didn't land); (3) walks `<root>/<bucket>/<aa>/<bb>/` via `Storage.list_blob_files/1` and deletes any file older than `:blob_grace_seconds` that is either a `.tmp.<rand>` leftover from a crashed PUT, or a regular blob with no `objects` row (rename succeeded but index commit didn't). The grace window is what keeps the third pass from racing legitimate in-flight PUTs. Defaults: 1h interval, 24h upload-abandon, 1h blob-grace. `KAFUN_GC_INTERVAL_SEC=0` disables periodic sweeps; `Kafun.GC.run_now/0` works regardless.
 
 **Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit/GC; tests `start_supervised!` their own Index pointing at a per-test tmp DB, and start GC with `interval_ms: 0` to disable the tick. If you introduce another long-lived process, gate it on the same flag. Multipart tests `Application.put_env(:kafun, :root, tmp)` to redirect the storage root.
 
@@ -58,7 +58,6 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 - `CopyObject` (`PUT` with `x-amz-copy-source`).
 - Versioning, ACLs, bucket policies, server-side encryption.
 - Content-addressed dedupe. Easy to retrofit: rename the on-disk file to `sha256(body)` and add a refcount in the index. Worth it on a homelab where the same wallpaper / backup tarball ends up in multiple buckets.
-- A blob-tree sweep in GC. Today the GC handles uploads only; orphan *blobs* (where the rename succeeded but the index commit didn't) still leak. Add a third pass that walks `<root>/<bucket>/<aa>/<bb>/` and `Index.get/2`s each entry, deleting rows-less files older than some grace.
 
 ## Migrator
 

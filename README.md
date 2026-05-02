@@ -27,6 +27,7 @@ curl 'http://localhost:8333/imouto?list-type=2&prefix=big'
 | `KAFUN_LOG_LEVEL`           | `info`                 | `debug` / `info` / `warning` / `error`. |
 | `KAFUN_GC_INTERVAL_SEC`     | `3600`                 | GC tick. `0` disables periodic sweeps. |
 | `KAFUN_GC_ABANDON_AFTER_SEC`| `86400`                | Multipart uploads older than this get aborted by GC. |
+| `KAFUN_GC_BLOB_GRACE_SEC`   | `3600`                 | Orphan blobs / `.tmp.*` leftovers older than this get GC'd. |
 
 ## Telemetry
 
@@ -42,7 +43,7 @@ Every handler emits one terminal event per request:
 | `[:kafun, :multipart, :upload_part]`| `duration`               | `upload_id`, `part_number` |
 | `[:kafun, :multipart, :complete]`  | `size`, `parts`, `duration` | `bucket`, `key`, `upload_id` |
 | `[:kafun, :multipart, :abort]`     | —                         | `upload_id` |
-| `[:kafun, :gc, :run]`              | `abandoned_uploads`, `orphan_dirs`, `duration` | — |
+| `[:kafun, :gc, :run]`              | `abandoned_uploads`, `orphan_dirs`, `orphan_blobs`, `duration` | — |
 
 Attach a handler with `:telemetry.attach_many/4`; nothing is pre-subscribed.
 
