@@ -47,7 +47,9 @@ defmodule Kafun.MixProject do
       {:phoenix_live_view, "~> 1.0"},
       {:phoenix_html, "~> 4.1"},
       {:phoenix_pubsub, "~> 2.1"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      # Migration / outbound HTTP.
+      {:req, "~> 0.5"}
     ]
   end
 end

@@ -3,6 +3,189 @@ defmodule KafunTest do
 
   alias Kafun.{GC, Index, Multipart, Storage, S3XML}
 
+  describe "Migrate.SigV4" do
+    alias Kafun.Migrate.SigV4
+
+    @fixed_now ~U[2026-05-02 12:00:00Z]
+
+    test "produces a structurally valid Authorization header with all required parts" do
+      headers =
+        SigV4.sign(:get, "https://example.com/bucket/key", [],
+          access_key: "AKIA0",
+          secret_key: "secret-shhh",
+          payload: {:hash, ""},
+          now: @fixed_now
+        )
+
+      auth = Enum.find_value(headers, fn {k, v} -> if k == "authorization", do: v end)
+      assert auth =~ ~r/^AWS4-HMAC-SHA256 Credential=AKIA0\/20260502\/us-east-1\/s3\/aws4_request, SignedHeaders=[a-z0-9;\-]+, Signature=[a-f0-9]{64}$/
+
+      assert {"x-amz-date", "20260502T120000Z"} in headers
+      assert Enum.any?(headers, fn {k, _} -> k == "x-amz-content-sha256" end)
+      assert Enum.any?(headers, fn {k, _} -> k == "host" end)
+    end
+
+    test "is deterministic — same inputs yield byte-identical signature" do
+      args = [
+        access_key: "AKIA0",
+        secret_key: "secret-shhh",
+        payload: {:hash, "hello"},
+        now: @fixed_now
+      ]
+
+      h1 = SigV4.sign(:put, "https://example.com/b/k", [{"content-type", "text/plain"}], args)
+      h2 = SigV4.sign(:put, "https://example.com/b/k", [{"content-type", "text/plain"}], args)
+
+      assert auth_of(h1) == auth_of(h2)
+    end
+
+    test "different bodies produce different signatures (hash payload)" do
+      base = [
+        access_key: "AKIA0",
+        secret_key: "secret-shhh",
+        now: @fixed_now
+      ]
+
+      h_a = SigV4.sign(:put, "https://example.com/b/k", [], [{:payload, {:hash, "A"}} | base])
+      h_b = SigV4.sign(:put, "https://example.com/b/k", [], [{:payload, {:hash, "B"}} | base])
+      refute auth_of(h_a) == auth_of(h_b)
+    end
+
+    test "UNSIGNED-PAYLOAD signs even with no body access" do
+      headers =
+        SigV4.sign(:put, "https://example.com/b/k", [],
+          access_key: "AKIA0",
+          secret_key: "secret-shhh",
+          payload: :unsigned,
+          now: @fixed_now
+        )
+
+      assert {"x-amz-content-sha256", "UNSIGNED-PAYLOAD"} in headers
+    end
+
+    defp auth_of(headers), do: Enum.find_value(headers, fn {k, v} -> if k == "authorization", do: v end)
+  end
+
+  describe "Migrate end-to-end via two Bandit instances over loopback" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-mig-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      Application.put_env(:kafun, :allowed_keys, MapSet.new([]))
+      start_supervised!({Index, db_path: db})
+
+      # Two Bandit instances on auto-allocated ports both serve Kafun.Router.
+      # In real deploys src and dst are different services on different hosts;
+      # for the test, sharing the storage backend is fine because we use
+      # different bucket names for src/dst — the migration is observable as
+      # objects landing under the dst bucket.
+      {:ok, src_pid} = Bandit.start_link(plug: Kafun.Router, port: 0, ip: {127, 0, 0, 1})
+      {:ok, dst_pid} = Bandit.start_link(plug: Kafun.Router, port: 0, ip: {127, 0, 0, 1})
+
+      src_port = port_of(src_pid)
+      dst_port = port_of(dst_pid)
+
+      on_exit(fn ->
+        Process.exit(src_pid, :normal)
+        Process.exit(dst_pid, :normal)
+        File.rm_rf!(tmp)
+      end)
+
+      %{
+        src_url: "http://127.0.0.1:#{src_port}",
+        dst_url: "http://127.0.0.1:#{dst_port}"
+      }
+    end
+
+    test "copies a populated src bucket into a fresh dst bucket", %{src_url: src_url, dst_url: dst_url} do
+      # Populate a "from-seaweed" bucket via the router directly.
+      Plug.Test.conn(:put, "/from-seaweed") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      for {k, body} <- [{"a/1", "alpha"}, {"a/2", "bravo"}, {"b/1", "charlie"}] do
+        Plug.Test.conn(:put, "/from-seaweed/#{k}", body)
+        |> Plug.Conn.put_req_header("content-type", "text/plain")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+      end
+
+      src = Kafun.Migrate.client(src_url, "AKIA0", "")
+      dst = Kafun.Migrate.client(dst_url, "AKIA0", "")
+
+      summary =
+        Kafun.Migrate.run(src, dst, "from-seaweed", dst_bucket: "into-kafun", concurrency: 4)
+
+      assert summary.copied == 3
+      assert summary.skipped == 0
+      assert summary.failed == 0
+      assert summary.bytes == byte_size("alpha") + byte_size("bravo") + byte_size("charlie")
+
+      # All three objects land under the renamed dst bucket with the right bytes.
+      for {k, body} <- [{"a/1", "alpha"}, {"a/2", "bravo"}, {"b/1", "charlie"}] do
+        assert {:ok, %{size: size, etag: etag}} = Index.get("into-kafun", k)
+        assert size == byte_size(body)
+        assert etag == :crypto.hash(:md5, body) |> Base.encode16(case: :lower)
+      end
+    end
+
+    test "is idempotent: re-running skips already-copied objects",
+         %{src_url: src_url, dst_url: dst_url} do
+      Plug.Test.conn(:put, "/seaweed-bucket") |> Kafun.Router.call(Kafun.Router.init([]))
+      Plug.Test.conn(:put, "/seaweed-bucket/k", "first") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      src = Kafun.Migrate.client(src_url, "AKIA0", "")
+      dst = Kafun.Migrate.client(dst_url, "AKIA0", "")
+
+      first = Kafun.Migrate.run(src, dst, "seaweed-bucket", dst_bucket: "kafun-bucket")
+      assert first.copied == 1
+
+      second = Kafun.Migrate.run(src, dst, "seaweed-bucket", dst_bucket: "kafun-bucket")
+      assert second.copied == 0
+      assert second.skipped == 1
+    end
+
+    test "dry_run reports counts without writing to the destination",
+         %{src_url: src_url, dst_url: dst_url} do
+      Plug.Test.conn(:put, "/dry-src") |> Kafun.Router.call(Kafun.Router.init([]))
+      Plug.Test.conn(:put, "/dry-src/k", "x") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      src = Kafun.Migrate.client(src_url, "AKIA0", "")
+      dst = Kafun.Migrate.client(dst_url, "AKIA0", "")
+
+      summary = Kafun.Migrate.run(src, dst, "dry-src", dst_bucket: "dry-dst", dry_run: true)
+      assert summary.copied == 1
+
+      # Destination bucket still doesn't exist.
+      refute Index.bucket_exists?("dry-dst")
+    end
+
+    test "preserves user metadata (x-amz-meta-*) across the copy",
+         %{src_url: src_url, dst_url: dst_url} do
+      Plug.Test.conn(:put, "/meta-src") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      Plug.Test.conn(:put, "/meta-src/m", "with-meta")
+      |> Plug.Conn.put_req_header("x-amz-meta-author", "naka")
+      |> Plug.Conn.put_req_header("content-type", "text/plain")
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      src = Kafun.Migrate.client(src_url, "AKIA0", "")
+      dst = Kafun.Migrate.client(dst_url, "AKIA0", "")
+      Kafun.Migrate.run(src, dst, "meta-src", dst_bucket: "meta-dst")
+
+      {:ok, meta} = Index.get("meta-dst", "m")
+      assert meta.content_type == "text/plain"
+      assert Map.get(meta.meta, "author") == "naka"
+    end
+
+    defp port_of(pid) do
+      info = ThousandIsland.listener_info(pid)
+
+      case info do
+        {:ok, {_ip, port}} -> port
+        port when is_integer(port) -> port
+      end
+    end
+  end
+
   describe "Storage.valid_key?/1 — path traversal protection" do
     test "rejects empty / oversize / control bytes" do
       refute Storage.valid_key?("")

@@ -124,7 +124,62 @@ existing backup tool (restic / rsync / borg) at `/sanzu/objects`. The
 two stores reconcile: as long as you restore both, kafun's GC will
 clean up any drift.
 
-## 8. Rollback
+## 8. Migrating from a SeaweedFS deployment
+
+Use the bundled `mix kafun.migrate` task (or its release equivalent —
+see below). It pulls every object from each bucket on the source S3
+endpoint and PUTs them into kafun. Idempotent: re-running only moves
+missing or changed objects.
+
+From a checkout of this repo (anywhere with network access to both ends):
+
+```sh
+mix kafun.migrate \
+  --src https://seaweed.harvelab.com \
+  --src-key BYQ9GQ79ZW0A9XBBWQRL \
+  --src-secret rmqrkge90UwNfY4jezN9a9RpNhA24l7pYxA8ZTeNNu \
+  --dst https://objects.harvelab.com \
+  --dst-key <a key from KAFUN_KEYS on yomi> \
+  --bucket imouto \
+  --concurrency 8
+```
+
+Useful flags:
+
+  --bucket NAME        Migrate one bucket. Omit to enumerate every source bucket.
+  --dry-run            Walk source + count without writing to dst.
+  --verify             HEAD destination after each PUT and confirm size matches.
+  --concurrency N      Parallel object copies (default 8).
+  --max-size BYTES     Skip + warn for objects larger than this (default 4 GiB —
+                       single-shot PUT, no multipart-aware migration).
+
+Resuming an interrupted run is automatic: every per-object copy starts with
+a HEAD on dst and skips if `(size, etag)` already match. Hit Ctrl-C, fix
+whatever, run the same command again.
+
+When the destination bucket should be a different name than the source's
+(e.g. tidying up legacy bucket names mid-migration), pass it as the dst
+argument to the API (`Kafun.Migrate.run(src, dst, "old-name", dst_bucket: "new-name")`)
+or — if doing it from the shell — migrate to the desired name then `aws s3 rb`
+the source bucket on seaweed once verified.
+
+For a one-shot from a yomi where this repo isn't checked out, you can also
+ship a release artefact and use `kafun rpc`:
+
+```sh
+/opt/kafun/bin/kafun rpc \
+  'Kafun.Migrate.run(
+     Kafun.Migrate.client("https://seaweed.harvelab.com", "BYQ...", "rmq..."),
+     Kafun.Migrate.client("http://localhost:8333", "BYQ...", ""),
+     "imouto",
+     concurrency: 8
+   )'
+```
+
+(progress is silent in this mode — check `/var/log/kafun/current` for the
+per-object telemetry).
+
+## 9. Rollback
 
 If a release is bad:
 
@@ -141,7 +196,7 @@ Index DB and blob tree are untouched between releases — only the
 index, restore the most recent `/var/backups/kafun/kafun-*.db` over
 `KAFUN_ROOT/index.db` while the service is stopped, then bring it back up.
 
-## 9. Day-2 ops
+## 10. Day-2 ops
 
 | Task | Command |
 | ---- | ------- |
@@ -156,7 +211,7 @@ index, restore the most recent `/var/backups/kafun/kafun-*.db` over
 | Status | `sudo /opt/kafun/bin/kafun rpc 'Kafun.GC.status()'` |
 | Bucket counts | `sqlite3 -readonly /sanzu/objects/index.db "SELECT bucket, COUNT(*) FROM objects GROUP BY bucket"` |
 
-## 10. When the world gets bigger
+## 11. When the world gets bigger
 
 If/when ACLs and multi-user land and kafun ships beyond the homelab,
 sibling service definitions for openrc (Alpine VMs) and systemd (anything
