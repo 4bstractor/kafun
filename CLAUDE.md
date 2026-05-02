@@ -8,11 +8,12 @@ Kafun is an S3-compatible blob service for the homelab. **Elixir / OTP 27 / Band
 
 ## Layout
 
-- `lib/kafun/application.ex` — supervision tree (`Kafun.Index` → `Bandit`)
+- `lib/kafun/application.ex` — supervision tree (`Kafun.Index` → `Kafun.GC` → `Bandit`)
 - `lib/kafun/router.ex` — Plug.Router; the entire S3 surface lives here
 - `lib/kafun/storage.ex` — filesystem blob ops (path scheme, streaming PUT, Range parsing, multipart concat)
 - `lib/kafun/index.ex` — single-conn SQLite GenServer, prepared statements, `upper_bound/1` for prefix → range, `uploads`/`parts` tables
 - `lib/kafun/multipart.ex` — initiate / upload-part / complete / abort orchestration; computes the `md5-of-md5s-N` ETag
+- `lib/kafun/gc.ex` — periodic janitor: aborts old uploads, deletes orphan part dirs, emits `[:kafun, :gc, :run]`
 - `lib/kafun/auth.ex` — SigV4 access-key extraction (header **and** querystring presigned URLs)
 - `lib/kafun/s3_xml.ex` — iolist builders + a Saxy-backed parser for the CompleteMultipartUpload body
 - `config/runtime.exs` — env-var ingest
@@ -43,16 +44,20 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 **Multipart.** `POST /:bucket/:key?uploads` initiates and returns an opaque `UploadId` (18 random bytes, url-safe base64). `PUT /:bucket/:key?partNumber=N&uploadId=…` streams the part to `<root>/.uploads/<id>/<n>` with the same temp+rename dance as a regular PUT. `POST /:bucket/:key?uploadId=…` parses the client-supplied parts list (Saxy `SimpleForm.parse_string`), validates each `(partNumber, etag)` against what we recorded, concatenates the parts in client-supplied order into the final blob, and writes the index entry. Final ETag is `md5(decode_hex(part1) || decode_hex(part2) || …)` plus `-N` — the canonical S3 formula. Abort (`DELETE /:bucket/:key?uploadId=…`) just blows away `<root>/.uploads/<id>` and the metadata rows. The two stores are ordered: index commit happens *after* the rename, so a crash mid-Complete leaves an orphan blob and an orphan upload row but never a half-installed index entry. Cleanup is the GC job's problem, not the request path's.
 
-**Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit; tests `start_supervised!` their own Index pointing at a per-test tmp DB. If you introduce another long-lived process, gate it on the same flag. Multipart tests `Application.put_env(:kafun, :root, tmp)` to redirect the storage root.
+**Telemetry.** Every request handler emits one terminal `[:kafun, <op>, :stop]` event with `:duration` (μs) and `:size` where applicable. Multipart has its own family — `[:kafun, :multipart, :initiate | :upload_part | :complete | :abort]`. GC emits `[:kafun, :gc, :run]` per sweep. Metadata always carries `:bucket` and `:key` for object ops (or `:upload_id` for multipart). To consume: `:telemetry.attach_many/4` against the events you care about; nothing's pre-attached. The router uses a small `emit/3` helper so adding a new event is one line.
+
+**GC.** `Kafun.GC` is a tick-based GenServer in the supervision tree. Each tick runs two passes: (1) `Index.list_abandoned_uploads/1` for `uploads` rows older than `:abandon_after`, calling `Multipart.abort/2` on each; (2) walks `<root>/.uploads/` for subdirs **without** a matching `uploads` row — these are crash-window orphans (rename succeeded, index commit didn't) and get `File.rm_rf`'d. Defaults: 1h interval, 24h abandon-after. Set `KAFUN_GC_INTERVAL_SEC=0` to disable periodic sweeps; `Kafun.GC.run_now/0` works regardless. The blob shard tree is **not** swept yet — that's a future job (walk shards, check each path against the index, delete unreferenced).
+
+**Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit/GC; tests `start_supervised!` their own Index pointing at a per-test tmp DB, and start GC with `interval_ms: 0` to disable the tick. If you introduce another long-lived process, gate it on the same flag. Multipart tests `Application.put_env(:kafun, :root, tmp)` to redirect the storage root.
 
 ## What's deliberately missing
 
-- `ListMultipartUploads` (`GET /:bucket?uploads`) and `ListParts` (`GET /:bucket/:key?uploadId=…`) — boto3 doesn't need these for the upload happy path; aws-cli does for `ls --recursive` of in-progress uploads.
+- `ListMultipartUploads` (`GET /:bucket?uploads`) and `ListParts` (`GET /:bucket/:key?uploadId=…`) — boto3 doesn't need these for the upload happy path; aws-cli does for `ls --recursive` of in-progress uploads. The admin UI will want these for visibility.
 - `UploadPartCopy` (`PUT /:bucket/:key?partNumber=…&uploadId=…` with `x-amz-copy-source`) — server-side range copy for assembling a new object from chunks of an existing one.
 - Delimiter / common-prefixes in ListObjectsV2. Most boto3 callers don't need it; `aws s3 ls s3://bucket/path/` does.
 - Versioning, ACLs, bucket policies, server-side encryption.
 - Content-addressed dedupe. Easy to retrofit: rename the on-disk file to `sha256(body)` and add a refcount in the index. Worth it on a homelab where the same wallpaper / backup tarball ends up in multiple buckets.
-- A GC sweep for orphan blobs / abandoned uploads. Walk `<root>/.uploads/` for dirs older than 24h with no matching `uploads` row → delete; walk shard dirs for files with no matching `objects` row → delete.
+- A blob-tree sweep in GC. Today the GC handles uploads only; orphan *blobs* (where the rename succeeded but the index commit didn't) still leak. Add a third pass that walks `<root>/<bucket>/<aa>/<bb>/` and `Index.get/2`s each entry, deleting rows-less files older than some grace.
 
 ## Migrator
 

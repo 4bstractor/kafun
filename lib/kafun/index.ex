@@ -75,6 +75,11 @@ defmodule Kafun.Index do
   @spec clear_upload(String.t()) :: :ok
   def clear_upload(upload_id), do: GenServer.call(@name, {:clear_upload, upload_id})
 
+  @spec list_abandoned_uploads(integer()) :: [String.t()]
+  def list_abandoned_uploads(before_unix_seconds) do
+    GenServer.call(@name, {:list_abandoned_uploads, before_unix_seconds})
+  end
+
   ## Server
 
   @impl true
@@ -197,7 +202,9 @@ defmodule Kafun.Index do
         WHERE upload_id = ? ORDER BY part_number
         """),
       drop_parts: prep(conn, "DELETE FROM parts WHERE upload_id = ?"),
-      drop_upload: prep(conn, "DELETE FROM uploads WHERE upload_id = ?")
+      drop_upload: prep(conn, "DELETE FROM uploads WHERE upload_id = ?"),
+      abandoned_uploads:
+        prep(conn, "SELECT upload_id FROM uploads WHERE initiated_at < ? ORDER BY initiated_at")
     }
   end
 
@@ -304,6 +311,11 @@ defmodule Kafun.Index do
     run(state, :drop_parts, [id])
     run(state, :drop_upload, [id])
     {:reply, :ok, state}
+  end
+
+  def handle_call({:list_abandoned_uploads, before}, _from, state) do
+    rows = fetch_all(state, :abandoned_uploads, [before])
+    {:reply, Enum.map(rows, fn [id] -> id end), state}
   end
 
   @impl true

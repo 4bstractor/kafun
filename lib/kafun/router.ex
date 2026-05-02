@@ -144,14 +144,29 @@ defmodule Kafun.Router do
 
   defp do_initiate(conn, bucket, key) do
     {:ok, upload_id} = Multipart.initiate(bucket, key, first_header(conn, "content-type"))
+
+    emit([:multipart, :initiate], %{}, %{
+      bucket: bucket,
+      key: key,
+      upload_id: upload_id
+    })
+
     send_xml(conn, 200, S3XML.initiate_multipart(bucket, key, upload_id))
   end
 
   defp do_upload_part(conn, upload_id, part_number_str) do
+    started = System.monotonic_time(:microsecond)
+
     case Integer.parse(part_number_str) do
       {n, ""} when n in 1..10_000 ->
         case Multipart.upload_part(conn, root(), upload_id, n) do
           {:ok, conn, etag} ->
+            emit(
+              [:multipart, :upload_part],
+              %{duration: System.monotonic_time(:microsecond) - started},
+              %{upload_id: upload_id, part_number: n}
+            )
+
             conn
             |> put_resp_header("etag", ~s|"#{etag}"|)
             |> send_resp(200, "")
@@ -166,10 +181,21 @@ defmodule Kafun.Router do
   end
 
   defp do_complete(conn, bucket, key, upload_id) do
+    started = System.monotonic_time(:microsecond)
     {:ok, body, conn} = Plug.Conn.read_body(conn, length: 5_000_000)
 
     with {:ok, parts} <- S3XML.parse_complete_body(body),
-         {:ok, %{etag: etag}} <- Multipart.complete(root(), upload_id, parts) do
+         {:ok, %{etag: etag, size: size}} <- Multipart.complete(root(), upload_id, parts) do
+      emit(
+        [:multipart, :complete],
+        %{
+          size: size,
+          parts: length(parts),
+          duration: System.monotonic_time(:microsecond) - started
+        },
+        %{bucket: bucket, key: key, upload_id: upload_id}
+      )
+
       location = build_location(conn, bucket, key)
       send_xml(conn, 200, S3XML.complete_multipart(location, bucket, key, etag))
     else
@@ -195,8 +221,12 @@ defmodule Kafun.Router do
 
   defp do_abort(conn, upload_id) do
     case Multipart.abort(root(), upload_id) do
-      :ok -> send_resp(conn, 204, "")
-      {:error, :no_such_upload} -> error(conn, 404, "NoSuchUpload", upload_id)
+      :ok ->
+        emit([:multipart, :abort], %{}, %{upload_id: upload_id})
+        send_resp(conn, 204, "")
+
+      {:error, :no_such_upload} ->
+        error(conn, 404, "NoSuchUpload", upload_id)
     end
   end
 
@@ -217,9 +247,16 @@ defmodule Kafun.Router do
   ## Object handlers.
 
   defp do_put(conn, bucket, key) do
+    started = System.monotonic_time(:microsecond)
     {:ok, conn, size, etag} = Storage.stream_put(conn, root(), bucket, key)
     content_type = first_header(conn, "content-type")
     :ok = Index.put(bucket, key, size, etag, content_type, System.system_time(:second))
+
+    emit(
+      [:put, :stop],
+      %{size: size, duration: System.monotonic_time(:microsecond) - started},
+      %{bucket: bucket, key: key}
+    )
 
     conn
     |> put_resp_header("etag", ~s|"#{etag}"|)
@@ -227,6 +264,8 @@ defmodule Kafun.Router do
   end
 
   defp do_get(conn, bucket, key) do
+    started = System.monotonic_time(:microsecond)
+
     case Index.get(bucket, key) do
       :not_found ->
         error(conn, 404, "NoSuchKey", key)
@@ -237,12 +276,24 @@ defmodule Kafun.Router do
 
         case Storage.parse_range(range_header, meta.size) do
           :none ->
+            emit(
+              [:get, :stop],
+              %{size: meta.size, duration: System.monotonic_time(:microsecond) - started},
+              %{bucket: bucket, key: key, range: false}
+            )
+
             conn
             |> put_meta_headers(meta)
             |> Plug.Conn.send_file(200, path)
 
           {:ok, start, stop} ->
             length = stop - start + 1
+
+            emit(
+              [:get, :stop],
+              %{size: length, duration: System.monotonic_time(:microsecond) - started},
+              %{bucket: bucket, key: key, range: true}
+            )
 
             conn
             |> put_meta_headers(meta)
@@ -274,12 +325,14 @@ defmodule Kafun.Router do
   defp do_delete(conn, bucket, key) do
     Storage.delete(root(), bucket, key)
     Index.delete(bucket, key)
+    emit([:delete, :stop], %{}, %{bucket: bucket, key: key})
     send_resp(conn, 204, "")
   end
 
   ## ListObjectsV2.
 
   defp list_objects(conn, bucket) do
+    started = System.monotonic_time(:microsecond)
     qs = conn.query_params
 
     prefix = Map.get(qs, "prefix", "")
@@ -294,6 +347,15 @@ defmodule Kafun.Router do
 
     {entries, truncated?, next} =
       Index.list(bucket, prefix: prefix, start_after: start_after, max_keys: max_keys)
+
+    emit(
+      [:list, :stop],
+      %{
+        count: length(entries),
+        duration: System.monotonic_time(:microsecond) - started
+      },
+      %{bucket: bucket, prefix: prefix, truncated: truncated?}
+    )
 
     body = S3XML.list_objects(bucket, prefix, max_keys, entries, truncated?, next)
     send_xml(conn, 200, body)
@@ -363,4 +425,8 @@ defmodule Kafun.Router do
   end
 
   defp root, do: Application.fetch_env!(:kafun, :root)
+
+  defp emit(suffix, measurements, metadata) do
+    :telemetry.execute([:kafun | suffix], measurements, metadata)
+  end
 end

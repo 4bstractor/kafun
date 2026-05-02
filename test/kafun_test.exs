@@ -1,7 +1,7 @@
 defmodule KafunTest do
   use ExUnit.Case, async: false
 
-  alias Kafun.{Index, Multipart, Storage, S3XML}
+  alias Kafun.{GC, Index, Multipart, Storage, S3XML}
 
   describe "Storage.parse_range/2" do
     test "absent / empty returns :none" do
@@ -219,5 +219,134 @@ defmodule KafunTest do
   defp put_part_conn(body) do
     conn = Plug.Test.conn(:put, "/x", body)
     {conn, body}
+  end
+
+  describe "GC sweep" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-gc-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+
+      start_supervised!(
+        {GC, root: tmp, interval_ms: 0, abandon_after_seconds: 60}
+      )
+
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      %{root: tmp}
+    end
+
+    test "removes uploads older than abandon_after", %{root: root} do
+      {:ok, fresh_id} = Multipart.initiate("b", "fresh", nil)
+      {:ok, stale_id} = Multipart.initiate("b", "stale", nil)
+
+      {conn, _} = put_part_conn(<<1, 2, 3>>)
+      {:ok, _, _} = Multipart.upload_part(conn, root, stale_id, 1)
+
+      # Backdate the stale upload past the cutoff.
+      :ok = backdate_upload(stale_id, System.system_time(:second) - 600)
+
+      assert %{abandoned: 1, orphans: 0} = GC.run_now()
+
+      assert :not_found = Index.get_upload(stale_id)
+      assert {:ok, _} = Index.get_upload(fresh_id)
+      refute File.exists?(Storage.uploads_dir(root, stale_id))
+    end
+
+    test "removes orphan part dirs with no DB row", %{root: root} do
+      orphan = "orphan-id"
+      File.mkdir_p!(Storage.uploads_dir(root, orphan))
+      File.write!(Path.join(Storage.uploads_dir(root, orphan), "1"), "junk")
+
+      assert %{orphans: 1} = GC.run_now()
+      refute File.exists?(Storage.uploads_dir(root, orphan))
+    end
+  end
+
+  defp backdate_upload(upload_id, ts) do
+    {:ok, conn} = Exqlite.Sqlite3.open(Application.fetch_env!(:kafun, :root) |> Path.join("index.db"))
+    :ok = Exqlite.Sqlite3.execute(conn, "UPDATE uploads SET initiated_at = #{ts} WHERE upload_id = '#{upload_id}'")
+    :ok = Exqlite.Sqlite3.close(conn)
+  end
+
+  describe "Telemetry events" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-tel-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      start_supervised!({GC, root: tmp, interval_ms: 0, abandon_after_seconds: 60})
+
+      handler = make_ref()
+      test_pid = self()
+
+      :telemetry.attach_many(
+        handler,
+        [
+          [:kafun, :put, :stop],
+          [:kafun, :get, :stop],
+          [:kafun, :multipart, :complete],
+          [:kafun, :gc, :run]
+        ],
+        fn name, measurements, metadata, _ ->
+          send(test_pid, {:telemetry, name, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn ->
+        :telemetry.detach(handler)
+        File.rm_rf!(tmp)
+      end)
+
+      %{root: tmp}
+    end
+
+    test "PUT through the router emits put.stop" do
+      conn =
+        Plug.Test.conn(:put, "/imouto/k", "hello")
+        |> Plug.Conn.put_req_header("content-type", "text/plain")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert_receive {:telemetry, [:kafun, :put, :stop],
+                      %{size: 5, duration: _}, %{bucket: "imouto", key: "k"}}
+    end
+
+    test "GC.run_now emits gc.run with both counters" do
+      GC.run_now()
+
+      assert_receive {:telemetry, [:kafun, :gc, :run],
+                      %{abandoned_uploads: _, orphan_dirs: _, duration: _}, _},
+                     1_000
+    end
+
+    test "multipart complete emits multipart.complete with parts count", %{root: root} do
+      {:ok, upload_id} = Multipart.initiate("imouto", "blob", nil)
+      {conn, _} = put_part_conn(<<1, 2, 3, 4>>)
+      {:ok, _, etag1} = Multipart.upload_part(conn, root, upload_id, 1)
+      {conn2, _} = put_part_conn(<<5, 6, 7, 8>>)
+      {:ok, _, etag2} = Multipart.upload_part(conn2, root, upload_id, 2)
+
+      complete_xml = """
+      <CompleteMultipartUpload>
+        <Part><PartNumber>1</PartNumber><ETag>"#{etag1}"</ETag></Part>
+        <Part><PartNumber>2</PartNumber><ETag>"#{etag2}"</ETag></Part>
+      </CompleteMultipartUpload>
+      """
+
+      conn =
+        Plug.Test.conn(:post, "/imouto/blob?uploadId=#{upload_id}", complete_xml)
+        |> Plug.Conn.put_req_header("content-type", "application/xml")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+
+      assert_receive {:telemetry, [:kafun, :multipart, :complete],
+                      %{size: 8, parts: 2, duration: _},
+                      %{bucket: "imouto", key: "blob", upload_id: ^upload_id}}
+    end
   end
 end

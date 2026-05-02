@@ -17,14 +17,34 @@ curl 'http://localhost:8333/imouto?list-type=2&prefix=big'
 
 ## Configuration
 
-| Env var            | Default                | Notes |
-| ------------------ | ---------------------- | ----- |
-| `KAFUN_ROOT`       | `${tmp}/kafun` in dev  | Required in prod. Blob root + default DB location. |
-| `KAFUN_DB`         | `<root>/index.db`      | SQLite metadata file. |
-| `KAFUN_HOST`       | `0.0.0.0`              | |
-| `KAFUN_PORT`       | `8333`                 | |
-| `KAFUN_KEYS`       | *(empty)*              | Comma-separated allowed access keys. Empty = auth off. |
-| `KAFUN_LOG_LEVEL`  | `info`                 | `debug` / `info` / `warning` / `error`. |
+| Env var                     | Default                | Notes |
+| --------------------------- | ---------------------- | ----- |
+| `KAFUN_ROOT`                | `${tmp}/kafun` in dev  | Required in prod. Blob root + default DB location. |
+| `KAFUN_DB`                  | `<root>/index.db`      | SQLite metadata file. |
+| `KAFUN_HOST`                | `0.0.0.0`              | |
+| `KAFUN_PORT`                | `8333`                 | |
+| `KAFUN_KEYS`                | *(empty)*              | Comma-separated allowed access keys. Empty = auth off. |
+| `KAFUN_LOG_LEVEL`           | `info`                 | `debug` / `info` / `warning` / `error`. |
+| `KAFUN_GC_INTERVAL_SEC`     | `3600`                 | GC tick. `0` disables periodic sweeps. |
+| `KAFUN_GC_ABANDON_AFTER_SEC`| `86400`                | Multipart uploads older than this get aborted by GC. |
+
+## Telemetry
+
+Every handler emits one terminal event per request:
+
+| Event                              | Measurements              | Metadata |
+| ---------------------------------- | ------------------------- | -------- |
+| `[:kafun, :put, :stop]`            | `size`, `duration`        | `bucket`, `key` |
+| `[:kafun, :get, :stop]`            | `size`, `duration`        | `bucket`, `key`, `range` |
+| `[:kafun, :delete, :stop]`         | —                         | `bucket`, `key` |
+| `[:kafun, :list, :stop]`           | `count`, `duration`       | `bucket`, `prefix`, `truncated` |
+| `[:kafun, :multipart, :initiate]`  | —                         | `bucket`, `key`, `upload_id` |
+| `[:kafun, :multipart, :upload_part]`| `duration`               | `upload_id`, `part_number` |
+| `[:kafun, :multipart, :complete]`  | `size`, `parts`, `duration` | `bucket`, `key`, `upload_id` |
+| `[:kafun, :multipart, :abort]`     | —                         | `upload_id` |
+| `[:kafun, :gc, :run]`              | `abandoned_uploads`, `orphan_dirs`, `duration` | — |
+
+Attach a handler with `:telemetry.attach_many/4`; nothing is pre-subscribed.
 
 ## Endpoints
 
