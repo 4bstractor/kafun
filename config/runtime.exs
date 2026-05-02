@@ -28,3 +28,36 @@ config :kafun,
 if level = System.get_env("KAFUN_LOG_LEVEL") do
   config :logger, level: String.to_atom(level)
 end
+
+## Admin UI runtime config.
+
+admin_secret =
+  case System.get_env("KAFUN_ADMIN_SECRET") do
+    nil ->
+      # Fresh per boot — sessions don't survive restarts. Set the env var
+      # to keep a stable signing key.
+      :crypto.strong_rand_bytes(64) |> Base.url_encode64() |> binary_part(0, 64)
+
+    s when byte_size(s) >= 64 ->
+      s
+
+    _ ->
+      raise "KAFUN_ADMIN_SECRET must be at least 64 bytes when set"
+  end
+
+{:ok, admin_ip} =
+  System.get_env("KAFUN_ADMIN_HOST", "0.0.0.0")
+  |> String.to_charlist()
+  |> :inet.parse_address()
+
+config :kafun, Kafun.Admin.Endpoint,
+  http: [
+    ip: admin_ip,
+    port: System.get_env("KAFUN_ADMIN_PORT", "8334") |> String.to_integer()
+  ],
+  secret_key_base: admin_secret,
+  server: Application.get_env(:kafun, :start_children?, true)
+
+config :kafun,
+  admin_password: System.get_env("KAFUN_ADMIN_PASSWORD"),
+  admin_user: System.get_env("KAFUN_ADMIN_USER", "admin")

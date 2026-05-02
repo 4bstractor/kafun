@@ -20,13 +20,15 @@ defmodule Kafun.Application do
         Logger.info("kafun starting: root=#{root} db=#{db_path} bind=#{host}:#{port}")
 
         [
+          {Phoenix.PubSub, name: Kafun.PubSub},
           {Kafun.Index, db_path: db_path},
           {Kafun.GC,
            root: root,
            interval_ms: gc_interval_ms,
            abandon_after_seconds: gc_abandon_after,
            blob_grace_seconds: gc_blob_grace},
-          {Bandit, plug: Kafun.Router, port: port, ip: parse_ip(host)}
+          {Bandit, plug: Kafun.Router, port: port, ip: parse_ip(host)},
+          Kafun.Admin.Endpoint
         ]
       else
         []

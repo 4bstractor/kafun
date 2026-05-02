@@ -10,14 +10,15 @@ Kafun is an S3-compatible blob service for the homelab. **Elixir / OTP 27 / Band
 
 | File | Purpose |
 | --- | --- |
-| `lib/kafun/application.ex`   | Supervision tree: `Kafun.Index` → `Kafun.GC` → `Bandit`. Reads runtime config; gated on `:start_children?` so tests can suppress it. |
-| `lib/kafun/router.ex`        | Plug.Router. Whole S3 surface; dispatches POST/PUT/GET/DELETE on object paths into multipart vs object-level handlers based on query params. |
+| `lib/kafun/application.ex`   | Supervision tree: `Phoenix.PubSub` → `Index` → `GC` → S3 `Bandit` → admin `Endpoint`. Reads runtime config; gated on `:start_children?` so tests can suppress it. |
+| `lib/kafun/router.ex`        | Plug.Router for the S3 wire. Dispatches POST/PUT/GET/DELETE on object paths into multipart vs object-level handlers based on query params. |
 | `lib/kafun/storage.ex`       | Filesystem blob ops. Path scheme `<root>/<bucket>/<aa>/<bb>/<key>` (sha1-sharded); atomic temp+rename writes; Range parsing; multipart concat; blob-tree walking for GC. |
 | `lib/kafun/index.ex`         | Single-conn SQLite GenServer with prepared statements. Tables: `objects`, `buckets`, `uploads`, `parts`. Listing scanner with prefix + delimiter + paginated continuation lives here. |
 | `lib/kafun/multipart.ex`     | Initiate / upload-part / complete / abort orchestration. Computes the `md5-of-md5s-N` ETag. |
-| `lib/kafun/gc.ex`            | Tick-based janitor — three passes (abandoned uploads, orphan part dirs, orphan blobs / leftover tmps). Emits `[:kafun, :gc, :run]`. |
+| `lib/kafun/gc.ex`            | Tick-based janitor — three passes (abandoned uploads, orphan part dirs, orphan blobs / leftover tmps). Caches its last-run summary for the admin Status page. Emits `[:kafun, :gc, :run]`. |
 | `lib/kafun/auth.ex`          | SigV4 access-key extraction (header + querystring presigned URLs). Signature is **not** verified. |
-| `lib/kafun/s3_xml.ex`        | iolist XML builders for every S3 response shape we emit + Saxy parser for the CompleteMultipartUpload body. |
+| `lib/kafun/s3_xml.ex`        | iolist XML builders for every S3 response shape we emit + Saxy parser for the CompleteMultipartUpload and Multi-Object Delete bodies. |
+| `lib/kafun/admin/`           | Phoenix admin UI. `Endpoint`/`Router`/`Layouts`/`Auth` plus four LiveViews: `BucketsLive` (index + create/delete), `BucketLive` (paginated browser, prefix nav, delete-key), `ObjectLive` (preview + meta view/edit, rename, delete), `UploadsLive` (in-flight multiparts + abort), `StatusLive` (GC + telemetry counters). Bound to `KAFUN_ADMIN_PORT` (default 8334). |
 | `config/runtime.exs`         | Env-var ingest. |
 
 ## Run
@@ -42,6 +43,9 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 | `KAFUN_GC_INTERVAL_SEC`       | `3600`                 | `0` disables periodic sweeps. |
 | `KAFUN_GC_ABANDON_AFTER_SEC`  | `86400`                | Multipart uploads older than this get aborted. |
 | `KAFUN_GC_BLOB_GRACE_SEC`     | `3600`                 | Orphan blobs / `.tmp.*` older than this get GC'd. |
+| `KAFUN_ADMIN_HOST` / `KAFUN_ADMIN_PORT` | `0.0.0.0` / `8334` | Phoenix admin UI bind. |
+| `KAFUN_ADMIN_USER` / `KAFUN_ADMIN_PASSWORD` | `admin` / *(empty)* | Basic-auth gate on the admin UI. Empty password leaves the UI open (trusted-network model). |
+| `KAFUN_ADMIN_SECRET`          | *(generated per boot)* | 64+ byte session signing key. Set to keep sessions across restarts. |
 
 ## Architecture notes
 
@@ -84,7 +88,9 @@ Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describ
 
 **Telemetry.** Every handler emits one terminal `[:kafun, <op>, :stop]` event with `:duration` (μs) and `:size` where applicable. Multipart family: `[:kafun, :multipart, :initiate | :upload_part | :complete | :abort]`. GC: `[:kafun, :gc, :run]`. Metadata always carries `:bucket` and `:key` for object ops (or `:upload_id` for multipart). Nothing pre-attaches — consumers call `:telemetry.attach_many/4`. Adding a new event is one line via the router's `emit/3` helper.
 
-**Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit/GC. Tests `start_supervised!` their own Index pointing at a per-test tmp DB and start GC with `interval_ms: 0` to disable the tick. Multipart tests `Application.put_env(:kafun, :root, tmp)` to redirect the storage root. If you introduce another long-lived process, gate it on the same flag.
+**Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit/GC/Admin endpoint. Tests `start_supervised!` their own Index pointing at a per-test tmp DB and start GC with `interval_ms: 0` to disable the tick. Multipart tests `Application.put_env(:kafun, :root, tmp)` to redirect the storage root. The admin endpoint's `server: …` config also keys off `start_children?`, so the test env doesn't need PubSub or a free port. If you introduce another long-lived process, gate it on the same flag.
+
+**Admin UI.** A Phoenix endpoint on a separate port (`KAFUN_ADMIN_PORT`, default 8334) serves the operator dashboard. Five LiveViews: `BucketsLive` (list with object-count + total-size aggregations from `Index.bucket_stats/0`, plus inline create/delete), `BucketLive` (paginated browser using the existing delimiter-aware listing, with breadcrumbs and per-row delete), `ObjectLive` (inline image preview, metadata view, edit-content-type-and-meta form, rename, delete), `UploadsLive` (cross-bucket in-flight multiparts via `Index.list_all_uploads/0`, with abort), `StatusLive` (GC `Kafun.GC.status/0` + telemetry counters attached per-LV-process and detached on terminate). Image preview uses the S3 surface URL with `?X-Amz-Credential=<KEY>/...` injected so the `<img>` tag works without an Authorization header — the auth layer already accepts presigned-style querystring credentials. Edit-metadata writes directly via `Index.put/7`, bypassing HTTP since same-key meta-only update is just an index row update; rename is `Storage.copy_blob` + `Index.put` + `Storage.delete` + `Index.delete`. Auth is HTTP Basic via `KAFUN_ADMIN_PASSWORD` (single shared credential — no user/identity model in v1, deliberately).
 
 ## What's left for S3 parity
 
@@ -115,9 +121,10 @@ Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (d
 
 ## Roadmap
 
-Phoenix admin UI (last per user direction). Light LiveView app — probably its own OTP app inside an umbrella, or a sibling Plug router on a separate port. Pages:
-- Buckets list with object counts and total size (needs new aggregation queries on `objects`).
-- Per-bucket browser with prefix navigation (delimiter listing already does the work).
-- In-flight multipart uploads (`Index.list_uploads/2`) with abort buttons.
-- GC status: last sweep counts, next tick ETA.
-- Telemetry counters live-updated from the existing events.
+Done: see "What's left for S3 parity" above (Tier 1 shipped) and `lib/kafun/admin/` for the LiveView dashboard. Open buckets with deferred work:
+
+- **CopyObject `metadata-directive=REPLACE` ✓ shipped** alongside the admin's edit-metadata flow (the UI takes a shortcut and updates the index directly, but the wire path supports REPLACE too).
+- **Tier-2 wire polish.** `x-amz-bucket-region` on HeadBucket success, multi-range GET, list-buckets pagination, object tagging stubs. None block real flows; revisit if a client complains.
+- **Pagination on the admin BucketLive.** Currently shows the first 100 entries per prefix and notes truncation. Wire `continuation` through query params when a real bucket has >100 keys at one prefix.
+- **Bulk select in admin BucketLive.** No checkbox-select-and-delete-many today; users get one delete at a time. Acceptable for v1.
+- **Mutable access keys / per-key permissions / multi-user.** Out of scope for v1 by user direction. Would need an `access_keys` table and rebuild of `Auth`. The Tier-3 list calls these out.

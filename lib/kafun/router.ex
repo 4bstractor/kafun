@@ -392,6 +392,7 @@ defmodule Kafun.Router do
          :ok <- eval_copy_preconditions(conn, src_meta),
          {:ok, _size} <- Storage.copy_blob(root(), src_bucket, src_key, dst_bucket, dst_key) do
       now = System.system_time(:second)
+      {dst_ct, dst_user_meta} = resolve_copy_metadata(conn, src_meta)
 
       :ok =
         Index.put(
@@ -399,9 +400,9 @@ defmodule Kafun.Router do
           dst_key,
           src_meta.size,
           src_meta.etag,
-          src_meta.content_type,
+          dst_ct,
           now,
-          Map.get(src_meta, :meta, %{})
+          dst_user_meta
         )
 
       emit(
@@ -466,6 +467,21 @@ defmodule Kafun.Router do
     case Index.get_upload(upload_id) do
       {:ok, u} -> {:ok, u}
       :not_found -> {:error, :no_such_upload}
+    end
+  end
+
+  # `x-amz-metadata-directive` controls whether the destination keeps the
+  # source's metadata (default `COPY`) or takes a fresh set from the request
+  # headers (`REPLACE`). REPLACE means "the request is authoritative" — so
+  # absent meta == empty meta on the destination, by S3 spec.
+  defp resolve_copy_metadata(conn, src_meta) do
+    case first_header(conn, "x-amz-metadata-directive") do
+      "REPLACE" ->
+        ct = first_header(conn, "content-type") || src_meta.content_type
+        {ct, collect_user_meta(conn)}
+
+      _ ->
+        {src_meta.content_type, Map.get(src_meta, :meta, %{})}
     end
   end
 

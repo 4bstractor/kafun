@@ -46,6 +46,14 @@ defmodule Kafun.Index do
   @spec list_buckets() :: [%{name: String.t(), created_at: integer()}]
   def list_buckets, do: GenServer.call(@name, :list_buckets)
 
+  @doc """
+  Per-bucket aggregates — object count and total bytes — for the admin UI's
+  buckets index. One scan over `objects` grouped by bucket; fine at homelab
+  scale (sqlite handles a few million rows in milliseconds).
+  """
+  @spec bucket_stats() :: [%{name: String.t(), object_count: non_neg_integer(), total_bytes: non_neg_integer(), created_at: integer()}]
+  def bucket_stats, do: GenServer.call(@name, :bucket_stats)
+
   @spec bucket_exists?(String.t()) :: boolean()
   def bucket_exists?(name), do: GenServer.call(@name, {:bucket_exists?, name})
 
@@ -133,6 +141,16 @@ defmodule Kafun.Index do
   def list_abandoned_uploads(before_unix_seconds) do
     GenServer.call(@name, {:list_abandoned_uploads, before_unix_seconds})
   end
+
+  @doc """
+  Cross-bucket listing of every in-flight multipart upload, newest first.
+  For the admin UI; not paginated since a homelab won't realistically have
+  more than a few dozen at once.
+  """
+  @spec list_all_uploads() ::
+          [%{bucket: String.t(), key: String.t(), upload_id: String.t(),
+             initiated_at: integer(), parts: non_neg_integer()}]
+  def list_all_uploads, do: GenServer.call(@name, :list_all_uploads)
 
   ## Server
 
@@ -255,6 +273,14 @@ defmodule Kafun.Index do
       ensure_bucket:
         prep(conn, "INSERT OR IGNORE INTO buckets (name, created_at) VALUES (?, ?)"),
       list_buckets: prep(conn, "SELECT name, created_at FROM buckets ORDER BY name"),
+      bucket_stats:
+        prep(conn, """
+        SELECT b.name,
+               b.created_at,
+               COALESCE((SELECT COUNT(*) FROM objects WHERE bucket = b.name), 0),
+               COALESCE((SELECT SUM(size) FROM objects WHERE bucket = b.name), 0)
+        FROM buckets b ORDER BY b.name
+        """),
       bucket_exists: prep(conn, "SELECT 1 FROM buckets WHERE name = ? LIMIT 1"),
       bucket_has_objects: prep(conn, "SELECT 1 FROM objects WHERE bucket = ? LIMIT 1"),
       delete_bucket: prep(conn, "DELETE FROM buckets WHERE name = ?"),
@@ -307,6 +333,13 @@ defmodule Kafun.Index do
         WHERE bucket = ?
           AND (key > ? OR (key = ? AND upload_id > ?))
         ORDER BY key, upload_id LIMIT ?
+        """),
+      list_all_uploads:
+        prep(conn, """
+        SELECT u.bucket, u.key, u.upload_id, u.initiated_at,
+               COALESCE((SELECT COUNT(*) FROM parts WHERE upload_id = u.upload_id), 0)
+        FROM uploads u
+        ORDER BY u.initiated_at DESC
         """),
       list_uploads_prefix:
         prep(conn, """
@@ -362,6 +395,17 @@ defmodule Kafun.Index do
   def handle_call(:list_buckets, _from, state) do
     rows = fetch_all(state, :list_buckets, [])
     out = Enum.map(rows, fn [n, ts] -> %{name: n, created_at: ts} end)
+    {:reply, out, state}
+  end
+
+  def handle_call(:bucket_stats, _from, state) do
+    rows = fetch_all(state, :bucket_stats, [])
+
+    out =
+      Enum.map(rows, fn [n, ts, count, bytes] ->
+        %{name: n, created_at: ts, object_count: count, total_bytes: bytes || 0}
+      end)
+
     {:reply, out, state}
   end
 
@@ -534,6 +578,17 @@ defmodule Kafun.Index do
   def handle_call({:list_abandoned_uploads, before}, _from, state) do
     rows = fetch_all(state, :abandoned_uploads, [before])
     {:reply, Enum.map(rows, fn [id] -> id end), state}
+  end
+
+  def handle_call(:list_all_uploads, _from, state) do
+    rows = fetch_all(state, :list_all_uploads, [])
+
+    out =
+      Enum.map(rows, fn [b, k, uid, init, parts] ->
+        %{bucket: b, key: k, upload_id: uid, initiated_at: init, parts: parts}
+      end)
+
+    {:reply, out, state}
   end
 
   @impl true

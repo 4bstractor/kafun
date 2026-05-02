@@ -36,6 +36,21 @@ defmodule Kafun.GC do
         }
   def run_now, do: GenServer.call(@name, :run_now, 60_000)
 
+  @doc """
+  The most recent sweep summary plus its timestamp, plus the configured
+  interval and the next-tick ETA. Used by the admin UI's status page.
+  Returns `nil` for `:last_result` if no sweep has run yet this boot.
+  """
+  @spec status() :: %{
+          interval_ms: non_neg_integer(),
+          last_result: %{abandoned: non_neg_integer(), orphans: non_neg_integer(),
+                          orphan_blobs: non_neg_integer(), duration_us: non_neg_integer()}
+                       | nil,
+          last_run_at: integer() | nil,
+          next_tick_at: integer() | nil
+        }
+  def status, do: GenServer.call(@name, :status)
+
   @impl true
   def init(opts) do
     interval_ms = Keyword.fetch!(opts, :interval_ms)
@@ -47,7 +62,10 @@ defmodule Kafun.GC do
       interval_ms: interval_ms,
       abandon_after: abandon_after,
       blob_grace: blob_grace,
-      root: root
+      root: root,
+      last_result: nil,
+      last_run_at: nil,
+      next_tick_at: maybe_next_tick(interval_ms)
     }
 
     schedule(interval_ms)
@@ -56,20 +74,47 @@ defmodule Kafun.GC do
 
   @impl true
   def handle_info(:tick, state) do
-    _ = sweep(state)
+    {result, duration} = sweep(state)
     schedule(state.interval_ms)
-    {:noreply, state}
+
+    {:noreply,
+     %{
+       state
+       | last_result: Map.put(result, :duration_us, duration),
+         last_run_at: System.system_time(:second),
+         next_tick_at: maybe_next_tick(state.interval_ms)
+     }}
   end
 
   @impl true
   def handle_call(:run_now, _from, state) do
-    {:reply, sweep(state), state}
+    {result, duration} = sweep(state)
+
+    {:reply, result,
+     %{
+       state
+       | last_result: Map.put(result, :duration_us, duration),
+         last_run_at: System.system_time(:second)
+     }}
+  end
+
+  def handle_call(:status, _from, state) do
+    {:reply,
+     %{
+       interval_ms: state.interval_ms,
+       last_result: state.last_result,
+       last_run_at: state.last_run_at,
+       next_tick_at: state.next_tick_at
+     }, state}
   end
 
   ## Internals.
 
   defp schedule(0), do: :ok
   defp schedule(ms) when ms > 0, do: Process.send_after(self(), :tick, ms)
+
+  defp maybe_next_tick(0), do: nil
+  defp maybe_next_tick(ms) when ms > 0, do: System.system_time(:second) + div(ms, 1000)
 
   defp sweep(state) do
     started = System.monotonic_time(:microsecond)
@@ -98,7 +143,7 @@ defmodule Kafun.GC do
         "orphan_blobs=#{orphan_blobs} duration_us=#{duration}"
     )
 
-    %{abandoned: abandoned, orphans: orphan_dirs, orphan_blobs: orphan_blobs}
+    {%{abandoned: abandoned, orphans: orphan_dirs, orphan_blobs: orphan_blobs}, duration}
   end
 
   defp sweep_abandoned_uploads(root, cutoff) do

@@ -891,6 +891,25 @@ defmodule KafunTest do
       assert Enum.all?(conn.resp_headers, fn {k, _} -> not String.starts_with?(k, "x-amz-meta-") end)
     end
 
+    test "CopyObject metadata-directive=REPLACE drops source meta and applies request headers" do
+      Plug.Test.conn(:put, "/imouto/src", "src body")
+      |> Plug.Conn.put_req_header("x-amz-meta-old", "should-be-gone")
+      |> Plug.Conn.put_req_header("content-type", "text/plain")
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      Plug.Test.conn(:put, "/imouto/dst", "")
+      |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/src")
+      |> Plug.Conn.put_req_header("x-amz-metadata-directive", "REPLACE")
+      |> Plug.Conn.put_req_header("x-amz-meta-fresh", "yes")
+      |> Plug.Conn.put_req_header("content-type", "image/png")
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      conn = Plug.Test.conn(:head, "/imouto/dst") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert ["yes"] = Plug.Conn.get_resp_header(conn, "x-amz-meta-fresh")
+      assert [] = Plug.Conn.get_resp_header(conn, "x-amz-meta-old")
+      assert ["image/png"] = Plug.Conn.get_resp_header(conn, "content-type")
+    end
+
     test "CopyObject (default COPY) preserves source metadata on the destination" do
       Plug.Test.conn(:put, "/imouto/src", "src body")
       |> Plug.Conn.put_req_header("x-amz-meta-tag", "carry-me")

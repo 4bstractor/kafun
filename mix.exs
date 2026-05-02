@@ -25,7 +25,13 @@ defmodule Kafun.MixProject do
       {:plug, "~> 1.16"},
       {:exqlite, "~> 0.27"},
       {:saxy, "~> 1.5"},
-      {:telemetry, "~> 1.3"}
+      {:telemetry, "~> 1.3"},
+      # Admin UI.
+      {:phoenix, "~> 1.7"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_html, "~> 4.1"},
+      {:phoenix_pubsub, "~> 2.1"},
+      {:jason, "~> 1.4"}
     ]
   end
 end

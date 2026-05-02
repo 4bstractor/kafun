@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en" class="bg-zinc-900">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <.live_title>kafun · admin</.live_title>
+    <link rel="icon" href={~p"/favicon.ico"} sizes="any" />
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+             background: #0d1117; color: #e6edf3; line-height: 1.5; }
+      a { color: #58a6ff; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      header { padding: 0.75rem 1.25rem; background: #161b22;
+               border-bottom: 1px solid #30363d; display: flex;
+               align-items: center; gap: 1.5rem; flex-wrap: wrap; }
+      header .brand { font-weight: 700; color: #f0f6fc; font-size: 1.1rem; }
+      header nav a { padding: 0.25rem 0; color: #c9d1d9; }
+      header nav a.active, header nav a:hover { color: #58a6ff; }
+      main { padding: 1.5rem 1.25rem; max-width: 1200px; margin: 0 auto; }
+      h1 { margin: 0 0 1rem; font-size: 1.4rem; color: #f0f6fc; }
+      h2 { font-size: 1.05rem; color: #e6edf3; margin: 1.5rem 0 0.5rem; }
+      table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+      th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #30363d; }
+      th { color: #8b949e; font-weight: 500; background: #161b22; }
+      tbody tr:hover { background: #161b22; }
+      td.num { text-align: right; font-variant-numeric: tabular-nums; }
+      .btn { display: inline-block; padding: 0.35rem 0.75rem; border-radius: 6px;
+             border: 1px solid #30363d; background: #21262d; color: #c9d1d9;
+             cursor: pointer; font: inherit; }
+      .btn:hover { background: #30363d; border-color: #8b949e; }
+      .btn-danger { color: #f85149; border-color: #6e2c2c; }
+      .btn-danger:hover { background: #6e2c2c; color: #fff; }
+      .btn-primary { color: #fff; border-color: #2ea043; background: #238636; }
+      .btn-primary:hover { background: #2ea043; }
+      input[type="text"], input[type="password"], textarea {
+        background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+        padding: 0.4rem 0.6rem; border-radius: 6px; font: inherit; width: 100%; }
+      .breadcrumbs { color: #8b949e; margin-bottom: 1rem; }
+      .breadcrumbs a + a::before { content: " / "; color: #30363d; }
+      .stack > * + * { margin-top: 0.75rem; }
+      .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+      .pill { display: inline-block; padding: 0.1rem 0.5rem; background: #21262d;
+              border: 1px solid #30363d; border-radius: 999px; font-size: 0.8rem;
+              color: #8b949e; }
+      .empty { padding: 2rem 1rem; text-align: center; color: #8b949e;
+               border: 1px dashed #30363d; border-radius: 8px; }
+      .preview img { max-width: 100%; max-height: 75vh; display: block;
+                     background: #0d1117; border: 1px solid #30363d; }
+      .meta-grid { display: grid; grid-template-columns: max-content 1fr; gap: 0.4rem 1.25rem; }
+      .meta-grid dt { color: #8b949e; }
+      .meta-grid dd { margin: 0; word-break: break-all; }
+      .flash { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; }
+      .flash-info { background: #1f3a5b; color: #cbd5e1; }
+      .flash-error { background: #6e2c2c; color: #fff; }
+    </style>
+    <script defer phx-track-static type="text/javascript" src={~p"/assets/phoenix.js"}></script>
+    <script defer phx-track-static type="text/javascript" src={~p"/assets/phoenix_live_view.js"}></script>
+    <script defer type="text/javascript">
+      window.addEventListener("DOMContentLoaded", () => {
+        let liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket, {
+          params: { _csrf_token: document.querySelector("meta[name='csrf-token']").content }
+        })
+        liveSocket.connect()
+        window.liveSocket = liveSocket
+      })
+    </script>
+  </head>
+  <body>
+    <header>
+      <span class="brand">kafun</span>
+      <nav class="row">
+        <.link navigate={~p"/buckets"}>Buckets</.link>
+        <.link navigate={~p"/uploads"}>Uploads</.link>
+        <.link navigate={~p"/status"}>Status</.link>
+      </nav>
+    </header>
+    <main>
+      {@inner_content}
+    </main>
+  </body>
+</html>
