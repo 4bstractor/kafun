@@ -1,0 +1,19 @@
+#!/bin/sh
+# /etc/sv/kafun/run — runit service entry. See DEPLOY.md.
+#
+# Sourcing /etc/kafun/kafun.env (set -a exports every assignment) keeps the
+# configuration in one editable file rather than spread across an envdir.
+# `chpst -u kafun:kafun` drops privileges before exec-ing the release; runit
+# supervises the resulting BEAM and forwards signals (SIGTERM → graceful
+# Bandit/Phoenix shutdown).
+
+exec 2>&1
+
+if [ -r /etc/kafun/kafun.env ]; then
+  set -a
+  . /etc/kafun/kafun.env
+  set +a
+fi
+
+cd /opt/kafun
+exec chpst -u kafun:kafun /opt/kafun/bin/kafun start

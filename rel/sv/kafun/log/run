@@ -1,0 +1,6 @@
+#!/bin/sh
+# /etc/sv/kafun/log/run — svlogd writes timestamped lines to
+# /var/log/kafun/current and rotates automatically (size + count tunable
+# via /var/log/kafun/config; defaults are fine for homelab volumes).
+
+exec chpst -u kafun:kafun svlogd -tt /var/log/kafun
