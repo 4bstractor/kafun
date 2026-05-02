@@ -270,6 +270,84 @@ defmodule Kafun.S3XML do
     end
   end
 
+  @doc """
+  Parse a Multi-Object Delete request body.
+
+      <Delete>
+        <Object><Key>k1</Key></Object>
+        ...
+        <Quiet>true</Quiet>
+      </Delete>
+
+  Returns `{:ok, %{keys: [...], quiet: bool}}`. Keys are surfaced in document
+  order. Malformed `<Object>` blocks (no `<Key>`) are dropped silently to
+  match S3's lenient behaviour.
+  """
+  @spec parse_delete_body(String.t()) ::
+          {:ok, %{keys: [String.t()], quiet: boolean()}} | {:error, atom()}
+  def parse_delete_body(xml) when is_binary(xml) do
+    case Saxy.SimpleForm.parse_string(xml) do
+      {:ok, {"Delete", _, children}} ->
+        keys = Enum.flat_map(children, &extract_object_key/1)
+        quiet = Enum.any?(children, &match_quiet/1)
+        {:ok, %{keys: keys, quiet: quiet}}
+
+      {:ok, _} ->
+        {:error, :bad_root}
+
+      {:error, _} ->
+        {:error, :invalid_xml}
+    end
+  end
+
+  defp extract_object_key({"Object", _, kids}) do
+    case find_child(kids, "Key") do
+      {:ok, k} when k != "" -> [k]
+      _ -> []
+    end
+  end
+
+  defp extract_object_key(_), do: []
+
+  defp match_quiet({"Quiet", _, kids}) do
+    kids
+    |> Enum.filter(&is_binary/1)
+    |> IO.iodata_to_binary()
+    |> String.trim()
+    |> String.downcase() == "true"
+  end
+
+  defp match_quiet(_), do: false
+
+  @doc """
+  Build the DeleteResult body. `deleted` is a list of keys; `errors` is a
+  list of `{key, code, message}` tuples. In `quiet` mode the `<Deleted>`
+  blocks are suppressed (`<Error>` blocks always emit).
+  """
+  @spec delete_result([String.t()], [{String.t(), String.t(), String.t()}], boolean()) :: iodata()
+  def delete_result(deleted, errors, quiet?) do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">|,
+      if(quiet?,
+        do: [],
+        else: Enum.map(deleted, &["<Deleted><Key>", esc(&1), "</Key></Deleted>"])
+      ),
+      Enum.map(errors, fn {k, code, msg} ->
+        [
+          "<Error><Key>",
+          esc(k),
+          "</Key><Code>",
+          esc(code),
+          "</Code><Message>",
+          esc(msg),
+          "</Message></Error>"
+        ]
+      end),
+      "</DeleteResult>"
+    ]
+  end
+
   @doc "Standard S3 error body."
   def error(code, message, resource \\ "") do
     [

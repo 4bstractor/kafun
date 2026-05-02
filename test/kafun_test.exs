@@ -591,6 +591,171 @@ defmodule KafunTest do
     end
   end
 
+  describe "S3XML.parse_delete_body/1" do
+    test "extracts keys in document order with quiet flag false by default" do
+      xml = """
+      <Delete>
+        <Object><Key>a/1</Key></Object>
+        <Object><Key>a/2</Key></Object>
+        <Object><Key>b</Key></Object>
+      </Delete>
+      """
+
+      assert {:ok, %{keys: ["a/1", "a/2", "b"], quiet: false}} =
+               S3XML.parse_delete_body(xml)
+    end
+
+    test "honours <Quiet>true</Quiet>" do
+      xml = "<Delete><Object><Key>k</Key></Object><Quiet>true</Quiet></Delete>"
+      assert {:ok, %{keys: ["k"], quiet: true}} = S3XML.parse_delete_body(xml)
+    end
+
+    test "drops <Object> entries without a Key" do
+      xml = "<Delete><Object/><Object><Key>k</Key></Object></Delete>"
+      assert {:ok, %{keys: ["k"], quiet: false}} = S3XML.parse_delete_body(xml)
+    end
+
+    test "rejects non-Delete root and malformed XML" do
+      assert {:error, :bad_root} = S3XML.parse_delete_body("<Other/>")
+      assert {:error, :invalid_xml} = S3XML.parse_delete_body("<broken>")
+    end
+  end
+
+  describe "S3XML.delete_result/3" do
+    test "emits Deleted and Error blocks in non-quiet mode" do
+      out =
+        S3XML.delete_result(["a", "b"], [{"bad", "InvalidKey", "key is not valid"}], false)
+        |> IO.iodata_to_binary()
+
+      assert out =~ "<Deleted><Key>a</Key></Deleted>"
+      assert out =~ "<Deleted><Key>b</Key></Deleted>"
+      assert out =~ "<Error><Key>bad</Key><Code>InvalidKey</Code>"
+    end
+
+    test "suppresses Deleted blocks when quiet, keeps Error blocks" do
+      out =
+        S3XML.delete_result(["a"], [{"bad", "InvalidKey", "x"}], true)
+        |> IO.iodata_to_binary()
+
+      refute out =~ "<Deleted>"
+      assert out =~ "<Error><Key>bad</Key>"
+    end
+  end
+
+  describe "Router DeleteObjects" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-deleteobjs-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      for k <- ["a/1", "a/2", "b/1"] do
+        Plug.Test.conn(:put, "/imouto/#{k}", "body of #{k}")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+      end
+
+      %{root: tmp}
+    end
+
+    test "deletes the listed keys, leaves others intact, returns Deleted XML", %{root: root} do
+      body = """
+      <Delete>
+        <Object><Key>a/1</Key></Object>
+        <Object><Key>a/2</Key></Object>
+      </Delete>
+      """
+
+      conn =
+        Plug.Test.conn(:post, "/imouto?delete", body)
+        |> Plug.Conn.put_req_header("content-type", "application/xml")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<Deleted><Key>a/1</Key></Deleted>"
+      assert conn.resp_body =~ "<Deleted><Key>a/2</Key></Deleted>"
+      refute conn.resp_body =~ "<Error>"
+
+      assert :not_found = Index.get("imouto", "a/1")
+      assert :not_found = Index.get("imouto", "a/2")
+      assert {:ok, _} = Index.get("imouto", "b/1")
+
+      refute File.exists?(Storage.blob_path(root, "imouto", "a/1"))
+      refute File.exists?(Storage.blob_path(root, "imouto", "a/2"))
+      assert File.exists?(Storage.blob_path(root, "imouto", "b/1"))
+    end
+
+    test "is idempotent: deleting a key that does not exist is not an error" do
+      body = "<Delete><Object><Key>never-existed</Key></Object></Delete>"
+
+      conn =
+        Plug.Test.conn(:post, "/imouto?delete", body)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<Deleted><Key>never-existed</Key></Deleted>"
+      refute conn.resp_body =~ "<Error>"
+    end
+
+    test "invalid keys come back as Error, others still delete", %{root: root} do
+      body = """
+      <Delete>
+        <Object><Key>a/1</Key></Object>
+        <Object><Key>../escape</Key></Object>
+      </Delete>
+      """
+
+      conn =
+        Plug.Test.conn(:post, "/imouto?delete", body)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<Deleted><Key>a/1</Key></Deleted>"
+      assert conn.resp_body =~ "<Error><Key>../escape</Key><Code>InvalidKey</Code>"
+
+      refute File.exists?(Storage.blob_path(root, "imouto", "a/1"))
+    end
+
+    test "quiet mode suppresses Deleted entries but keeps Errors" do
+      body = """
+      <Delete>
+        <Quiet>true</Quiet>
+        <Object><Key>a/1</Key></Object>
+        <Object><Key>../bad</Key></Object>
+      </Delete>
+      """
+
+      conn =
+        Plug.Test.conn(:post, "/imouto?delete", body)
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      refute conn.resp_body =~ "<Deleted>"
+      assert conn.resp_body =~ "<Error><Key>../bad</Key>"
+    end
+
+    test "empty Delete body is rejected as MalformedXML" do
+      conn =
+        Plug.Test.conn(:post, "/imouto?delete", "<Delete></Delete>")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "MalformedXML"
+    end
+
+    test "POST without ?delete is a 400 InvalidRequest" do
+      conn =
+        Plug.Test.conn(:post, "/imouto", "<Delete/>")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "InvalidRequest"
+    end
+  end
+
   describe "Router HEAD bucket" do
     setup do
       tmp = Path.join(System.tmp_dir!(), "kafun-head-#{System.unique_integer([:positive])}")

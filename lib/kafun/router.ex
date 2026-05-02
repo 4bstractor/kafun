@@ -6,6 +6,7 @@ defmodule Kafun.Router do
       GET    /                                     → ListAllMyBuckets
       PUT    /:bucket                              → CreateBucket
       HEAD   /:bucket                              → HeadBucket
+      POST   /:bucket?delete                       → DeleteObjects (multi-delete)
       GET    /:bucket?list-type=2&prefix=&...      → ListObjectsV2 (delimiter-aware)
       GET    /:bucket?uploads&...                  → ListMultipartUploads
       POST   /:bucket/<key>?uploads                → InitiateMultipartUpload
@@ -79,6 +80,19 @@ defmodule Kafun.Router do
 
       true ->
         send_resp(conn, 404, "")
+    end
+  end
+
+  post "/:bucket" do
+    cond do
+      not Storage.valid_bucket?(bucket) ->
+        error(conn, 400, "InvalidBucketName", "bucket name is not valid")
+
+      Map.has_key?(conn.query_params, "delete") ->
+        do_delete_objects(conn, bucket)
+
+      true ->
+        error(conn, 400, "InvalidRequest", "POST on a bucket requires ?delete")
     end
   end
 
@@ -417,6 +431,61 @@ defmodule Kafun.Router do
       )
 
     send_xml(conn, 200, body)
+  end
+
+  defp do_delete_objects(conn, bucket) do
+    started = System.monotonic_time(:microsecond)
+
+    case Plug.Conn.read_body(conn, length: 1_048_576) do
+      {:more, _, _} ->
+        error(conn, 400, "MalformedXML", "Delete body exceeds 1 MiB")
+
+      {:ok, body, conn} ->
+        case S3XML.parse_delete_body(body) do
+          {:ok, %{keys: []}} ->
+            error(conn, 400, "MalformedXML", "no <Object> entries in Delete body")
+
+          {:ok, %{keys: keys}} when length(keys) > 1000 ->
+            error(conn, 400, "MalformedXML", "Delete request exceeds 1000 keys")
+
+          {:ok, %{keys: keys, quiet: quiet?}} ->
+            {deleted, errors} = run_delete_objects(bucket, keys)
+
+            emit(
+              [:delete_objects, :stop],
+              %{
+                count: length(keys),
+                deleted: length(deleted),
+                errors: length(errors),
+                duration: System.monotonic_time(:microsecond) - started
+              },
+              %{bucket: bucket}
+            )
+
+            send_xml(
+              conn,
+              200,
+              S3XML.delete_result(Enum.reverse(deleted), Enum.reverse(errors), quiet?)
+            )
+
+          {:error, _} ->
+            error(conn, 400, "MalformedXML", "could not parse Delete body")
+        end
+    end
+  end
+
+  defp run_delete_objects(bucket, keys) do
+    Enum.reduce(keys, {[], []}, fn key, {ok, errs} ->
+      cond do
+        not Storage.valid_key?(key) ->
+          {ok, [{key, "InvalidKey", "key is not valid"} | errs]}
+
+        true ->
+          :ok = Index.delete(bucket, key)
+          :ok = Storage.delete(root(), bucket, key)
+          {[key | ok], errs}
+      end
+    end)
   end
 
   defp list_multipart_uploads(conn, bucket) do
