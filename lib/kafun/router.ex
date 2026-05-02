@@ -5,6 +5,7 @@ defmodule Kafun.Router do
       GET    /healthz                              → liveness, never auth-gated
       GET    /                                     → ListAllMyBuckets
       PUT    /:bucket                              → CreateBucket
+      HEAD   /:bucket                              → HeadBucket
       GET    /:bucket?list-type=2&prefix=&...      → ListObjectsV2 (delimiter-aware)
       GET    /:bucket?uploads&...                  → ListMultipartUploads
       POST   /:bucket/<key>?uploads                → InitiateMultipartUpload
@@ -65,6 +66,19 @@ defmodule Kafun.Router do
 
       true ->
         list_objects(conn, bucket)
+    end
+  end
+
+  match "/:bucket", via: :head do
+    cond do
+      not Storage.valid_bucket?(bucket) ->
+        send_resp(conn, 400, "")
+
+      Enum.any?(Index.list_buckets(), &(&1.name == bucket)) ->
+        send_resp(conn, 200, "")
+
+      true ->
+        send_resp(conn, 404, "")
     end
   end
 

@@ -328,6 +328,101 @@ defmodule KafunTest do
     {conn, body}
   end
 
+  describe "Storage.stream_put — aws-chunked unwrap" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-chunked-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      %{root: tmp}
+    end
+
+    test "unsigned chunked body with CRC32 trailer round-trips clean", %{root: root} do
+      data = :crypto.strong_rand_bytes(50_000)
+      body = chunked(data, trailer: "x-amz-checksum-crc32:abcdef12")
+      conn = chunked_conn(body, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+
+      {:ok, _conn, size, etag} = Storage.stream_put(conn, root, "b", "k")
+
+      assert size == byte_size(data)
+      assert etag == :crypto.hash(:md5, data) |> Base.encode16(case: :lower)
+      assert File.read!(Storage.blob_path(root, "b", "k")) == data
+    end
+
+    test "signed chunked body with chunk-signature extension is unwrapped", %{root: root} do
+      data = :crypto.strong_rand_bytes(20_000)
+      body = chunked(data, ext: ";chunk-signature=" <> String.duplicate("a", 64))
+      conn = chunked_conn(body, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+
+      {:ok, _conn, size, _etag} = Storage.stream_put(conn, root, "b", "k")
+      assert size == byte_size(data)
+      assert File.read!(Storage.blob_path(root, "b", "k")) == data
+    end
+
+    test "multi-chunk body is glued back together in order", %{root: root} do
+      data = :crypto.strong_rand_bytes(30_000)
+      body = chunked(data, chunk_size: 4_096)
+      conn = chunked_conn(body, "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+
+      {:ok, _conn, size, etag} = Storage.stream_put(conn, root, "b", "k")
+      assert size == byte_size(data)
+      assert etag == :crypto.hash(:md5, data) |> Base.encode16(case: :lower)
+      assert File.read!(Storage.blob_path(root, "b", "k")) == data
+    end
+
+    test "Content-Encoding: aws-chunked also activates the unwrap path", %{root: root} do
+      data = "hello aws-chunked world"
+      body = chunked(data)
+
+      conn =
+        Plug.Test.conn(:put, "/b/k", body)
+        |> Plug.Conn.put_req_header("content-encoding", "aws-chunked")
+
+      {:ok, _conn, size, _etag} = Storage.stream_put(conn, root, "b", "k")
+      assert size == byte_size(data)
+      assert File.read!(Storage.blob_path(root, "b", "k")) == data
+    end
+
+    test "plain bodies still pass through unchanged", %{root: root} do
+      data = "no chunked envelope here"
+      conn = Plug.Test.conn(:put, "/b/k", data)
+
+      {:ok, _conn, size, etag} = Storage.stream_put(conn, root, "b", "k")
+      assert size == byte_size(data)
+      assert etag == :crypto.hash(:md5, data) |> Base.encode16(case: :lower)
+      assert File.read!(Storage.blob_path(root, "b", "k")) == data
+    end
+  end
+
+  defp chunked_conn(body, sha256_marker) do
+    Plug.Test.conn(:put, "/b/k", body)
+    |> Plug.Conn.put_req_header("x-amz-content-sha256", sha256_marker)
+  end
+
+  defp chunked(data, opts \\ []) do
+    chunk_size = Keyword.get(opts, :chunk_size, max(byte_size(data), 1))
+    ext = Keyword.get(opts, :ext, "")
+    trailer = Keyword.get(opts, :trailer, "")
+
+    chunks = split_for_test(data, chunk_size)
+
+    framed =
+      Enum.map_join(chunks, "", fn c ->
+        hex = byte_size(c) |> Integer.to_string(16)
+        "#{hex}#{ext}\r\n" <> c <> "\r\n"
+      end)
+
+    trailer_line = if trailer == "", do: "", else: trailer <> "\r\n"
+    framed <> "0#{ext}\r\n" <> trailer_line <> "\r\n"
+  end
+
+  defp split_for_test("", _n), do: []
+  defp split_for_test(data, n) when byte_size(data) <= n, do: [data]
+
+  defp split_for_test(data, n) do
+    <<head::binary-size(n), rest::binary>> = data
+    [head | split_for_test(rest, n)]
+  end
+
   describe "GC sweep" do
     setup do
       tmp = Path.join(System.tmp_dir!(), "kafun-gc-#{System.unique_integer([:positive])}")
@@ -493,6 +588,40 @@ defmodule KafunTest do
       assert_receive {:telemetry, [:kafun, :multipart, :complete],
                       %{size: 8, parts: 2, duration: _},
                       %{bucket: "imouto", key: "blob", upload_id: ^upload_id}}
+    end
+  end
+
+  describe "Router HEAD bucket" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-head-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      %{root: tmp}
+    end
+
+    test "200 for an existing bucket" do
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      conn = Plug.Test.conn(:head, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 200
+      assert conn.resp_body == ""
+    end
+
+    test "404 for a bucket that has not been created" do
+      conn =
+        Plug.Test.conn(:head, "/does-not-exist") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body == ""
+    end
+
+    test "400 for a syntactically invalid bucket name" do
+      conn = Plug.Test.conn(:head, "/INVALID") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 400
+      assert conn.resp_body == ""
     end
   end
 end

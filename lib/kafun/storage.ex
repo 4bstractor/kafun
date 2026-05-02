@@ -83,15 +83,137 @@ defmodule Kafun.Storage do
   end
 
   defp consume(conn, fd, size, ctx) do
+    if aws_chunked?(conn) do
+      consume_chunked(conn, fd, size, ctx, "", :size_line)
+    else
+      consume_plain(conn, fd, size, ctx)
+    end
+  end
+
+  defp consume_plain(conn, fd, size, ctx) do
     case Plug.Conn.read_body(conn, length: @chunk, read_length: @chunk) do
       {:more, chunk, conn} ->
         :ok = :file.write(fd, chunk)
-        consume(conn, fd, size + byte_size(chunk), :crypto.hash_update(ctx, chunk))
+        consume_plain(conn, fd, size + byte_size(chunk), :crypto.hash_update(ctx, chunk))
 
       {:ok, chunk, conn} ->
         :ok = :file.write(fd, chunk)
         {conn, size + byte_size(chunk), :crypto.hash_update(ctx, chunk)}
     end
+  end
+
+  # An S3 PUT is `aws-chunked` when either `Content-Encoding` advertises it or
+  # `x-amz-content-sha256` is one of the `STREAMING-…` markers. Three on-the-wire
+  # variants share the same chunk grammar — extensions and trailers vary, but
+  # the parser below ignores both, so a single state machine handles all three.
+  defp aws_chunked?(conn) do
+    enc = conn |> Plug.Conn.get_req_header("content-encoding") |> Enum.join(",")
+    sha = conn |> Plug.Conn.get_req_header("x-amz-content-sha256") |> List.first() || ""
+    String.contains?(enc, "aws-chunked") or String.starts_with?(sha, "STREAMING-")
+  end
+
+  # Drives `parse_chunks/5` with bytes from `Plug.Conn.read_body/2`. Reads the
+  # next 64 KiB only when the parser asks for more, so a multi-GB body never
+  # buffers in memory.
+  defp consume_chunked(conn, fd, size, ctx, buf, state) do
+    case parse_chunks(buf, state, fd, size, ctx) do
+      {:done, size, ctx} ->
+        drain_remaining(conn, size, ctx)
+
+      {:more, buf2, state2, size2, ctx2} ->
+        case Plug.Conn.read_body(conn, length: @chunk, read_length: @chunk) do
+          {:more, chunk, conn} ->
+            consume_chunked(conn, fd, size2, ctx2, buf2 <> chunk, state2)
+
+          {:ok, chunk, conn} ->
+            flush_chunked(conn, fd, size2, ctx2, buf2 <> chunk, state2)
+        end
+    end
+  end
+
+  defp flush_chunked(conn, fd, size, ctx, buf, state) do
+    case parse_chunks(buf, state, fd, size, ctx) do
+      {:done, size, ctx} ->
+        {conn, size, ctx}
+
+      {:more, _, state, _, _} ->
+        raise "aws-chunked body ended mid-stream in state #{inspect(state)}"
+    end
+  end
+
+  defp drain_remaining(conn, size, ctx) do
+    case Plug.Conn.read_body(conn, length: @chunk, read_length: @chunk) do
+      {:more, _, conn} -> drain_remaining(conn, size, ctx)
+      {:ok, _, conn} -> {conn, size, ctx}
+    end
+  end
+
+  # Walks the buffer through the chunked grammar:
+  #
+  #   chunk      = HEX *(";" ext) CRLF data CRLF
+  #   last-chunk = "0" *(";" ext) CRLF *(trailer-line CRLF) CRLF
+  #
+  # Returns `{:done, size, ctx}` once the terminator is consumed, or
+  # `{:more, leftover, state, size, ctx}` when the buffer runs out mid-token.
+  defp parse_chunks(buf, :size_line, fd, size, ctx) do
+    case :binary.split(buf, "\r\n") do
+      [_] ->
+        {:more, buf, :size_line, size, ctx}
+
+      [line, rest] ->
+        case parse_chunk_size(line) do
+          0 -> parse_chunks(rest, :trailer, fd, size, ctx)
+          n -> parse_chunks(rest, {:data, n}, fd, size, ctx)
+        end
+    end
+  end
+
+  defp parse_chunks(buf, {:data, n}, fd, size, ctx) when n > 0 do
+    case buf do
+      <<data::binary-size(n), rest::binary>> ->
+        :ok = :file.write(fd, data)
+        parse_chunks(rest, :data_crlf, fd, size + n, :crypto.hash_update(ctx, data))
+
+      _ ->
+        buf_n = byte_size(buf)
+
+        if buf_n > 0 do
+          :ok = :file.write(fd, buf)
+        end
+
+        {:more, "", {:data, n - buf_n}, size + buf_n, :crypto.hash_update(ctx, buf)}
+    end
+  end
+
+  defp parse_chunks(buf, :data_crlf, fd, size, ctx) do
+    case buf do
+      <<"\r\n", rest::binary>> -> parse_chunks(rest, :size_line, fd, size, ctx)
+      <<"\r">> -> {:more, buf, :data_crlf, size, ctx}
+      "" -> {:more, "", :data_crlf, size, ctx}
+      _ -> raise "aws-chunked: expected CRLF after chunk data"
+    end
+  end
+
+  defp parse_chunks(buf, :trailer, fd, size, ctx) do
+    case :binary.split(buf, "\r\n") do
+      [_] ->
+        {:more, buf, :trailer, size, ctx}
+
+      ["", _rest] ->
+        {:done, size, ctx}
+
+      [_line, rest] ->
+        parse_chunks(rest, :trailer, fd, size, ctx)
+    end
+  end
+
+  defp parse_chunk_size(line) do
+    hex =
+      case :binary.split(line, ";") do
+        [h | _] -> String.trim(h)
+      end
+
+    String.to_integer(hex, 16)
   end
 
   @spec delete(Path.t(), String.t(), String.t()) :: :ok
