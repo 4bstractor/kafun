@@ -7,7 +7,23 @@ defmodule Kafun.MixProject do
       version: "0.1.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      releases: releases()
+    ]
+  end
+
+  defp releases do
+    [
+      kafun: [
+        # Bundle ERTS so the target box doesn't need Erlang/Elixir installed.
+        include_executables_for: [:unix],
+        include_erts: true,
+        applications: [
+          runtime_tools: :permanent
+        ],
+        # Strip beams; significant size win.
+        strip_beams: true
+      ]
     ]
   end
 

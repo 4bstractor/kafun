@@ -152,6 +152,16 @@ defmodule Kafun.Index do
              initiated_at: integer(), parts: non_neg_integer()}]
   def list_all_uploads, do: GenServer.call(@name, :list_all_uploads)
 
+  @doc """
+  Snapshot the SQLite database to `target_path` via `VACUUM INTO`. Produces
+  a single consistent file even with WAL enabled and concurrent writers.
+  Caller is responsible for the destination directory existing and being
+  writeable. Times out at 30s — `VACUUM INTO` on a multi-GB index can be
+  slow and we don't want to block the GenServer for arbitrarily long.
+  """
+  @spec backup_to(Path.t()) :: :ok | {:error, term()}
+  def backup_to(target_path), do: GenServer.call(@name, {:backup_to, target_path}, 30_000)
+
   ## Server
 
   @impl true
@@ -589,6 +599,15 @@ defmodule Kafun.Index do
       end)
 
     {:reply, out, state}
+  end
+
+  def handle_call({:backup_to, path}, _from, state) do
+    # SQLite's VACUUM INTO is safe with WAL and produces a clean copy; the
+    # path is embedded in SQL with single-quote-doubling because it can't
+    # be parameterised.
+    sql = "VACUUM INTO '#{String.replace(path, "'", "''")}'"
+
+    {:reply, Sqlite3.execute(state.conn, sql), state}
   end
 
   @impl true

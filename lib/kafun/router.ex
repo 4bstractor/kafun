@@ -30,7 +30,7 @@ defmodule Kafun.Router do
 
   alias Kafun.{Auth, Index, Multipart, S3XML, Storage}
 
-  plug Plug.Logger, log: :debug
+  plug Plug.Logger, log: :info
   plug :stamp_request
   plug :fetch_qs
   plug :match

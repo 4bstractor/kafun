@@ -32,18 +32,31 @@ end
 ## Admin UI runtime config.
 
 admin_secret =
-  case System.get_env("KAFUN_ADMIN_SECRET") do
-    nil ->
-      # Fresh per boot — sessions don't survive restarts. Set the env var
-      # to keep a stable signing key.
+  case {config_env(), System.get_env("KAFUN_ADMIN_SECRET")} do
+    {:prod, nil} ->
+      raise """
+      KAFUN_ADMIN_SECRET is required in production.
+      Generate one with: mix phx.gen.secret  (or `openssl rand -base64 64`).
+      Setting a stable secret means admin sessions survive a restart.
+      """
+
+    {_, nil} ->
+      # Dev/test: fresh per boot. Sessions don't survive restarts.
       :crypto.strong_rand_bytes(64) |> Base.url_encode64() |> binary_part(0, 64)
 
-    s when byte_size(s) >= 64 ->
+    {_, s} when byte_size(s) >= 64 ->
       s
 
-    _ ->
+    {_, _} ->
       raise "KAFUN_ADMIN_SECRET must be at least 64 bytes when set"
   end
+
+if config_env() == :prod and System.get_env("KAFUN_KEYS", "") == "" do
+  IO.warn(
+    "KAFUN_KEYS is empty — running with auth disabled in production. " <>
+      "OK for trusted-LAN setups (the design point), but make sure that's intentional."
+  )
+end
 
 {:ok, admin_ip} =
   System.get_env("KAFUN_ADMIN_HOST", "0.0.0.0")

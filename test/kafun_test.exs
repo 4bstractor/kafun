@@ -155,6 +155,24 @@ defmodule KafunTest do
       assert :not_found == Index.get("b", "k")
     end
 
+    test "backup_to/1 produces a readable snapshot of the index", %{tmp: tmp} do
+      :ok = Index.put("b", "k", 5, "etag", nil, 0)
+
+      target = Path.join(tmp, "snapshot.db")
+      assert :ok = Index.backup_to(target)
+      assert File.regular?(target)
+
+      # Open the snapshot and verify the row landed.
+      {:ok, conn} = Exqlite.Sqlite3.open(target)
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "SELECT key, size FROM objects")
+      {:row, [k, sz]} = Exqlite.Sqlite3.step(conn, stmt)
+      :ok = Exqlite.Sqlite3.release(conn, stmt)
+      :ok = Exqlite.Sqlite3.close(conn)
+
+      assert k == "k"
+      assert sz == 5
+    end
+
     test "list with prefix and pagination" do
       for k <- ["a", "b/1", "b/2", "b/3", "c"] do
         :ok = Index.put("b", k, 1, "e", nil, 0)

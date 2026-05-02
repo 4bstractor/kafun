@@ -19,7 +19,10 @@ Kafun is an S3-compatible blob service for the homelab. **Elixir / OTP 27 / Band
 | `lib/kafun/auth.ex`          | SigV4 access-key extraction (header + querystring presigned URLs). Signature is **not** verified. |
 | `lib/kafun/s3_xml.ex`        | iolist XML builders for every S3 response shape we emit + Saxy parser for the CompleteMultipartUpload and Multi-Object Delete bodies. |
 | `lib/kafun/admin/`           | Phoenix admin UI. `Endpoint`/`Router`/`Layouts`/`Auth` plus four LiveViews: `BucketsLive` (index + create/delete), `BucketLive` (paginated browser, prefix nav, delete-key), `ObjectLive` (preview + meta view/edit, rename, delete), `UploadsLive` (in-flight multiparts + abort), `StatusLive` (GC + telemetry counters). Bound to `KAFUN_ADMIN_PORT` (default 8334). |
-| `config/runtime.exs`         | Env-var ingest. |
+| `lib/kafun/backup.ex`        | `Kafun.Backup.run/0` — wraps `Index.backup_to/1` with a default `/var/backups/kafun/kafun-<ts>.db` path. Cron-friendly via the release's `rpc` command. |
+| `rel/`                       | Deploy artifacts: `kafun.service` systemd unit, `kafun.env.example` env template. Used by `DEPLOY.md`. |
+| `config/runtime.exs`         | Env-var ingest. Hardened: prod requires a stable `KAFUN_ADMIN_SECRET`; dev/test fall back to a per-boot value. |
+| `DEPLOY.md`                  | Production deployment runbook — release build, systemd install, NPM upstream, backup cron, rollback. |
 
 ## Run
 
@@ -30,6 +33,8 @@ KAFUN_ROOT=/sanzu/objects KAFUN_KEYS=key1,key2 mix run --no-halt
 ```
 
 Single-test run: `mix test test/kafun_test.exs:LINE` or `mix test --only describe:"Index round-trip"`.
+
+For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix release`; the systemd unit and env template live under `rel/`. The release bundles ERTS so the target host needs no Elixir/Erlang.
 
 ## Configuration
 
