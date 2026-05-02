@@ -39,6 +39,9 @@ defmodule Kafun.Index do
   @spec list_buckets() :: [%{name: String.t(), created_at: integer()}]
   def list_buckets, do: GenServer.call(@name, :list_buckets)
 
+  @spec bucket_exists?(String.t()) :: boolean()
+  def bucket_exists?(name), do: GenServer.call(@name, {:bucket_exists?, name})
+
   @doc """
   ListObjectsV2 with prefix + delimiter + pagination.
 
@@ -218,6 +221,7 @@ defmodule Kafun.Index do
       ensure_bucket:
         prep(conn, "INSERT OR IGNORE INTO buckets (name, created_at) VALUES (?, ?)"),
       list_buckets: prep(conn, "SELECT name, created_at FROM buckets ORDER BY name"),
+      bucket_exists: prep(conn, "SELECT 1 FROM buckets WHERE name = ? LIMIT 1"),
       list_open:
         prep(conn, """
         SELECT key, size, etag, mtime FROM objects
@@ -315,6 +319,16 @@ defmodule Kafun.Index do
     rows = fetch_all(state, :list_buckets, [])
     out = Enum.map(rows, fn [n, ts] -> %{name: n, created_at: ts} end)
     {:reply, out, state}
+  end
+
+  def handle_call({:bucket_exists?, name}, _from, state) do
+    exists =
+      case fetch_one(state, :bucket_exists, [name]) do
+        [_] -> true
+        _ -> false
+      end
+
+    {:reply, exists, state}
   end
 
   def handle_call({:list, bucket, opts}, _from, state) do

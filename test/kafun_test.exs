@@ -542,6 +542,8 @@ defmodule KafunTest do
         File.rm_rf!(tmp)
       end)
 
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+
       %{root: tmp}
     end
 
@@ -588,6 +590,141 @@ defmodule KafunTest do
       assert_receive {:telemetry, [:kafun, :multipart, :complete],
                       %{size: 8, parts: 2, duration: _},
                       %{bucket: "imouto", key: "blob", upload_id: ^upload_id}}
+    end
+  end
+
+  describe "Router CopyObject + UploadPartCopy" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-copy-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      Plug.Test.conn(:put, "/imouto/src/key", "hello copy world")
+      |> Plug.Conn.put_req_header("content-type", "text/plain")
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      %{root: tmp}
+    end
+
+    test "CopyObject duplicates bytes, preserves etag and content-type", %{root: root} do
+      conn =
+        Plug.Test.conn(:put, "/imouto/dst/key", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/src/key")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<CopyObjectResult"
+      assert conn.resp_body =~ "<ETag>"
+
+      {:ok, %{size: size, etag: etag, content_type: ct}} = Index.get("imouto", "dst/key")
+      assert size == byte_size("hello copy world")
+      assert etag == :crypto.hash(:md5, "hello copy world") |> Base.encode16(case: :lower)
+      assert ct == "text/plain"
+
+      assert File.read!(Storage.blob_path(root, "imouto", "dst/key")) == "hello copy world"
+    end
+
+    test "CopyObject returns NoSuchKey when source is missing" do
+      conn =
+        Plug.Test.conn(:put, "/imouto/dst/key", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/never-existed")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchKey"
+    end
+
+    test "CopyObject decodes URL-encoded source keys", %{root: root} do
+      Plug.Test.conn(:put, "/imouto/funny key/with spaces", "encoded body")
+      |> Kafun.Router.call(Kafun.Router.init([]))
+
+      conn =
+        Plug.Test.conn(:put, "/imouto/dst", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/funny%20key/with%20spaces")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert File.read!(Storage.blob_path(root, "imouto", "dst")) == "encoded body"
+    end
+
+    test "CopyObject accepts source without leading slash", %{root: root} do
+      conn =
+        Plug.Test.conn(:put, "/imouto/dst", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "imouto/src/key")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert File.read!(Storage.blob_path(root, "imouto", "dst")) == "hello copy world"
+    end
+
+    test "CopyObject with malformed copy-source returns InvalidArgument" do
+      conn =
+        Plug.Test.conn(:put, "/imouto/dst", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "no-slash-no-key")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "InvalidArgument"
+    end
+
+    test "UploadPartCopy ingests a full-source copy as a multipart part", %{root: root} do
+      {:ok, upload_id} = Multipart.initiate("imouto", "assembled", nil)
+
+      conn =
+        Plug.Test.conn(:put, "/imouto/assembled?partNumber=1&uploadId=#{upload_id}", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/src/key")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<CopyPartResult"
+
+      part_path = Storage.part_path(root, upload_id, 1)
+      assert File.read!(part_path) == "hello copy world"
+
+      [part] = Index.list_parts(upload_id)
+      assert part.size == byte_size("hello copy world")
+      assert part.etag == :crypto.hash(:md5, "hello copy world") |> Base.encode16(case: :lower)
+    end
+
+    test "UploadPartCopy honours x-amz-copy-source-range", %{root: root} do
+      {:ok, upload_id} = Multipart.initiate("imouto", "assembled", nil)
+
+      # bytes 6..9 of "hello copy world" = "copy"
+      conn =
+        Plug.Test.conn(:put, "/imouto/assembled?partNumber=1&uploadId=#{upload_id}", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/src/key")
+        |> Plug.Conn.put_req_header("x-amz-copy-source-range", "bytes=6-9")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert File.read!(Storage.part_path(root, upload_id, 1)) == "copy"
+    end
+
+    test "UploadPartCopy returns NoSuchUpload for an unknown upload id" do
+      conn =
+        Plug.Test.conn(:put, "/imouto/x?partNumber=1&uploadId=ghost", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/src/key")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchUpload"
+    end
+
+    test "UploadPartCopy returns NoSuchKey when source is missing" do
+      {:ok, upload_id} = Multipart.initiate("imouto", "x", nil)
+
+      conn =
+        Plug.Test.conn(:put, "/imouto/x?partNumber=1&uploadId=#{upload_id}", "")
+        |> Plug.Conn.put_req_header("x-amz-copy-source", "/imouto/never-existed")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchKey"
     end
   end
 
@@ -756,6 +893,148 @@ defmodule KafunTest do
     end
   end
 
+  describe "ListObjectsV2 — encoding-type, fetch-owner, cursor precedence" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-list-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      for k <- ["plain", "with space/01", "with space/02", "ünicode/é"] do
+        :ok = Index.put("imouto", k, 1, "deadbeef", nil, 1_700_000_000)
+      end
+
+      :ok
+    end
+
+    test "encoding-type=url echoes the marker and URL-encodes keys" do
+      conn =
+        Plug.Test.conn(:get, "/imouto?list-type=2&encoding-type=url")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<EncodingType>url</EncodingType>"
+      assert conn.resp_body =~ "<Key>with%20space/01</Key>"
+      assert conn.resp_body =~ "<Key>%C3%BCnicode/%C3%A9</Key>"
+      assert conn.resp_body =~ "<Key>plain</Key>"
+    end
+
+    test "no encoding-type leaves keys as raw XML-escaped strings" do
+      conn =
+        Plug.Test.conn(:get, "/imouto?list-type=2") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.resp_body =~ "<Key>with space/01</Key>"
+      refute conn.resp_body =~ "<EncodingType>"
+    end
+
+    test "fetch-owner=true emits Owner blocks on Contents" do
+      conn =
+        Plug.Test.conn(:get, "/imouto?list-type=2&fetch-owner=true")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.resp_body =~ "<Owner><ID>kafun</ID><DisplayName>kafun</DisplayName></Owner>"
+    end
+
+    test "fetch-owner default omits Owner blocks" do
+      conn =
+        Plug.Test.conn(:get, "/imouto?list-type=2") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      refute conn.resp_body =~ "<Owner>"
+    end
+
+    test "continuation-token wins when both it and start-after are sent" do
+      # First page with max-keys=1 → next continuation token points past 'plain'.
+      conn1 =
+        Plug.Test.conn(:get, "/imouto?list-type=2&max-keys=1")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      [_, token] = Regex.run(~r{<NextContinuationToken>(.+?)</NextContinuationToken>}, conn1.resp_body)
+
+      # Send both: a CT past 'plain' and a start-after at the very end. CT must win.
+      conn2 =
+        Plug.Test.conn(
+          :get,
+          "/imouto?list-type=2&continuation-token=#{token}&start-after=zzz"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn2.status == 200
+      # Should still return entries past the CT — start-after=zzz would have skipped everything.
+      assert conn2.resp_body =~ "<Key>"
+    end
+  end
+
+  describe "Request id plumbing" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-rid-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      :ok
+    end
+
+    test "every response carries x-amz-request-id" do
+      conn = Plug.Test.conn(:get, "/healthz") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert [id] = Plug.Conn.get_resp_header(conn, "x-amz-request-id")
+      assert String.length(id) == 16
+      assert Regex.match?(~r/^[0-9A-F]{16}$/, id)
+    end
+
+    test "error responses echo the same request id in the body" do
+      conn = Plug.Test.conn(:get, "/ghost?list-type=2") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert [id] = Plug.Conn.get_resp_header(conn, "x-amz-request-id")
+      assert conn.resp_body =~ "<RequestId>#{id}</RequestId>"
+      assert conn.resp_body =~ "<HostId>#{id}</HostId>"
+    end
+  end
+
+  describe "Router NoSuchBucket" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-nsb-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      %{root: tmp}
+    end
+
+    test "PUT to a bucket that was never created returns 404 NoSuchBucket" do
+      conn =
+        Plug.Test.conn(:put, "/ghost/key", "x")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchBucket"
+    end
+
+    test "GET listing on a never-created bucket returns 404 NoSuchBucket" do
+      conn =
+        Plug.Test.conn(:get, "/ghost?list-type=2")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchBucket"
+    end
+
+    test "POST ?delete on a never-created bucket returns 404 NoSuchBucket" do
+      conn =
+        Plug.Test.conn(:post, "/ghost?delete", "<Delete><Object><Key>x</Key></Object></Delete>")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body =~ "NoSuchBucket"
+    end
+  end
+
   describe "Router HEAD bucket" do
     setup do
       tmp = Path.join(System.tmp_dir!(), "kafun-head-#{System.unique_integer([:positive])}")
@@ -781,12 +1060,48 @@ defmodule KafunTest do
 
       assert conn.status == 404
       assert conn.resp_body == ""
+      assert ["NoSuchBucket"] = Plug.Conn.get_resp_header(conn, "x-amz-error-code")
     end
 
     test "400 for a syntactically invalid bucket name" do
       conn = Plug.Test.conn(:head, "/INVALID") |> Kafun.Router.call(Kafun.Router.init([]))
       assert conn.status == 400
       assert conn.resp_body == ""
+      assert ["InvalidBucketName"] = Plug.Conn.get_resp_header(conn, "x-amz-error-code")
+    end
+  end
+
+  describe "HEAD object 404 surfaces x-amz-error-code" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-head404-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      Plug.Test.conn(:put, "/imouto") |> Kafun.Router.call(Kafun.Router.init([]))
+      :ok
+    end
+
+    test "missing key returns empty body with NoSuchKey header" do
+      conn =
+        Plug.Test.conn(:head, "/imouto/never-existed")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body == ""
+      assert ["NoSuchKey"] = Plug.Conn.get_resp_header(conn, "x-amz-error-code")
+    end
+
+    test "HEAD on a missing bucket returns NoSuchBucket header (no body)" do
+      conn =
+        Plug.Test.conn(:head, "/ghost-bucket/some-key")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 404
+      assert conn.resp_body == ""
+      assert ["NoSuchBucket"] = Plug.Conn.get_resp_header(conn, "x-amz-error-code")
     end
   end
 end

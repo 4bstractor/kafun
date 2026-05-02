@@ -222,6 +222,104 @@ defmodule Kafun.Storage do
     :ok
   end
 
+  @doc """
+  Server-side copy of a whole blob between (bucket, key) pairs. Identical
+  bytes mean the source ETag carries forward, so the caller doesn't have
+  to re-hash. Atomic temp+rename like `stream_put/4`.
+  """
+  @spec copy_blob(Path.t(), String.t(), String.t(), String.t(), String.t()) ::
+          {:ok, non_neg_integer()} | {:error, :not_found}
+  def copy_blob(root, src_bucket, src_key, dst_bucket, dst_key) do
+    src = blob_path(root, src_bucket, src_key)
+
+    if File.regular?(src) do
+      final = blob_path(root, dst_bucket, dst_key)
+      File.mkdir_p!(Path.dirname(final))
+      tmp = final <> ".tmp." <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+      try do
+        {:ok, size} = :file.copy(src, tmp)
+        :ok = :file.rename(tmp, final)
+        {:ok, size}
+      rescue
+        e ->
+          _ = :file.delete(tmp)
+          reraise e, __STACKTRACE__
+      end
+    else
+      {:error, :not_found}
+    end
+  end
+
+  @doc """
+  Copy a (possibly ranged) slice of a source blob into the multipart part
+  slot. Computes MD5 inline so the part can take an etag without a second
+  pass. `range` is `nil` for the whole object or `{start, stop}` (inclusive,
+  zero-indexed) for a window.
+  """
+  @spec copy_part(Path.t(), String.t(), String.t(), String.t(), pos_integer(),
+                  nil | {non_neg_integer(), non_neg_integer()}) ::
+          {:ok, non_neg_integer(), String.t()} | {:error, :not_found}
+  def copy_part(root, src_bucket, src_key, upload_id, part_number, range) do
+    src = blob_path(root, src_bucket, src_key)
+
+    if File.regular?(src) do
+      dst = part_path(root, upload_id, part_number)
+      File.mkdir_p!(Path.dirname(dst))
+      tmp = dst <> ".tmp." <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+      {:ok, in_fd} = :file.open(src, [:read, :raw, :binary, :read_ahead])
+      {:ok, out_fd} = :file.open(tmp, [:write, :raw, :binary, :delayed_write])
+
+      try do
+        remaining =
+          case range do
+            {start, stop} ->
+              {:ok, _} = :file.position(in_fd, start)
+              stop - start + 1
+
+            nil ->
+              :infinity
+          end
+
+        {size, ctx} = copy_md5(in_fd, out_fd, 0, :crypto.hash_init(:md5), remaining)
+        :ok = :file.close(out_fd)
+        :ok = :file.rename(tmp, dst)
+        etag = ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
+        {:ok, size, etag}
+      rescue
+        e ->
+          _ = :file.close(out_fd)
+          _ = :file.delete(tmp)
+          reraise e, __STACKTRACE__
+      after
+        _ = :file.close(in_fd)
+      end
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp copy_md5(_in_fd, _out_fd, total, ctx, 0), do: {total, ctx}
+
+  defp copy_md5(in_fd, out_fd, total, ctx, remaining) do
+    to_read = if remaining == :infinity, do: @chunk, else: min(remaining, @chunk)
+
+    case :file.read(in_fd, to_read) do
+      {:ok, data} ->
+        :ok = :file.write(out_fd, data)
+        n = byte_size(data)
+
+        next_remaining =
+          if remaining == :infinity, do: :infinity, else: remaining - n
+
+        copy_md5(in_fd, out_fd, total + n, :crypto.hash_update(ctx, data), next_remaining)
+
+      :eof ->
+        {total, ctx}
+    end
+  end
+
   ## Multipart helpers.
 
   @spec part_path(Path.t(), String.t(), pos_integer()) :: Path.t()

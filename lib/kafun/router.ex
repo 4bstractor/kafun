@@ -12,7 +12,9 @@ defmodule Kafun.Router do
       POST   /:bucket/<key>?uploads                → InitiateMultipartUpload
       POST   /:bucket/<key>?uploadId=…             → CompleteMultipartUpload
       PUT    /:bucket/<key>                        → PutObject (streamed)
+      PUT    /:bucket/<key> + x-amz-copy-source    → CopyObject
       PUT    /:bucket/<key>?partNumber=N&uploadId= → UploadPart (streamed)
+      PUT    /:bucket/<key>?…&x-amz-copy-source    → UploadPartCopy
       GET    /:bucket/<key>                        → GetObject (sendfile + Range)
       GET    /:bucket/<key>?uploadId=…             → ListParts
       HEAD   /:bucket/<key>                        → HeadObject
@@ -26,10 +28,19 @@ defmodule Kafun.Router do
   alias Kafun.{Auth, Index, Multipart, S3XML, Storage}
 
   plug Plug.Logger, log: :debug
+  plug :stamp_request
   plug :fetch_qs
   plug :match
   plug :authenticate
   plug :dispatch
+
+  defp stamp_request(conn, _) do
+    id = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :upper)
+
+    conn
+    |> assign(:request_id, id)
+    |> put_resp_header("x-amz-request-id", id)
+  end
 
   defp fetch_qs(conn, _), do: Plug.Conn.fetch_query_params(conn)
 
@@ -62,6 +73,9 @@ defmodule Kafun.Router do
       not Storage.valid_bucket?(bucket) ->
         error(conn, 400, "InvalidBucketName", "bucket name is not valid")
 
+      not Index.bucket_exists?(bucket) ->
+        error(conn, 404, "NoSuchBucket", "bucket does not exist")
+
       Map.has_key?(conn.query_params, "uploads") ->
         list_multipart_uploads(conn, bucket)
 
@@ -73,13 +87,13 @@ defmodule Kafun.Router do
   match "/:bucket", via: :head do
     cond do
       not Storage.valid_bucket?(bucket) ->
-        send_resp(conn, 400, "")
+        error(conn, 400, "InvalidBucketName", "bucket name is not valid")
 
-      Enum.any?(Index.list_buckets(), &(&1.name == bucket)) ->
+      Index.bucket_exists?(bucket) ->
         send_resp(conn, 200, "")
 
       true ->
-        send_resp(conn, 404, "")
+        error(conn, 404, "NoSuchBucket", "bucket does not exist")
     end
   end
 
@@ -87,6 +101,9 @@ defmodule Kafun.Router do
     cond do
       not Storage.valid_bucket?(bucket) ->
         error(conn, 400, "InvalidBucketName", "bucket name is not valid")
+
+      not Index.bucket_exists?(bucket) ->
+        error(conn, 404, "NoSuchBucket", "bucket does not exist")
 
       Map.has_key?(conn.query_params, "delete") ->
         do_delete_objects(conn, bucket)
@@ -159,12 +176,19 @@ defmodule Kafun.Router do
 
   defp dispatch_put(conn, bucket, key) do
     qs = conn.query_params
+    copy_src = first_header(conn, "x-amz-copy-source")
 
-    case {qs["uploadId"], qs["partNumber"]} do
-      {uid, n_str} when is_binary(uid) and is_binary(n_str) ->
+    case {qs["uploadId"], qs["partNumber"], copy_src} do
+      {uid, n_str, src} when is_binary(uid) and is_binary(n_str) and is_binary(src) ->
+        do_upload_part_copy(conn, uid, n_str, src)
+
+      {uid, n_str, nil} when is_binary(uid) and is_binary(n_str) ->
         do_upload_part(conn, uid, n_str)
 
-      {nil, nil} ->
+      {nil, nil, src} when is_binary(src) ->
+        do_copy_object(conn, bucket, key, src)
+
+      {nil, nil, nil} ->
         do_put(conn, bucket, key)
 
       _ ->
@@ -312,6 +336,107 @@ defmodule Kafun.Router do
     |> send_resp(200, "")
   end
 
+  defp do_copy_object(conn, dst_bucket, dst_key, src_header) do
+    started = System.monotonic_time(:microsecond)
+
+    with {:ok, src_bucket, src_key} <- parse_copy_source(src_header),
+         true <- Storage.valid_bucket?(src_bucket) and Storage.valid_key?(src_key),
+         {:ok, src_meta} <- fetch_src_meta(src_bucket, src_key),
+         {:ok, _size} <- Storage.copy_blob(root(), src_bucket, src_key, dst_bucket, dst_key) do
+      now = System.system_time(:second)
+      :ok = Index.put(dst_bucket, dst_key, src_meta.size, src_meta.etag, src_meta.content_type, now)
+
+      emit(
+        [:copy, :stop],
+        %{size: src_meta.size, duration: System.monotonic_time(:microsecond) - started},
+        %{src_bucket: src_bucket, src_key: src_key, bucket: dst_bucket, key: dst_key}
+      )
+
+      send_xml(conn, 200, S3XML.copy_object_result(src_meta.etag, now))
+    else
+      false -> error(conn, 400, "InvalidArgument", "source bucket or key invalid")
+      {:error, :invalid_copy_source} -> error(conn, 400, "InvalidArgument", "x-amz-copy-source malformed")
+      {:error, :no_such_key} -> error(conn, 404, "NoSuchKey", "source object does not exist")
+      {:error, :not_found} -> error(conn, 404, "NoSuchKey", "source object missing on disk")
+    end
+  end
+
+  defp do_upload_part_copy(conn, upload_id, part_number_str, src_header) do
+    started = System.monotonic_time(:microsecond)
+
+    with {n, ""} <- Integer.parse(part_number_str),
+         true <- n in 1..10_000,
+         {:ok, src_bucket, src_key} <- parse_copy_source(src_header),
+         true <- Storage.valid_bucket?(src_bucket) and Storage.valid_key?(src_key),
+         {:ok, _upload} <- fetch_upload(upload_id),
+         {:ok, src_meta} <- fetch_src_meta(src_bucket, src_key),
+         {:range, range} when range != :invalid <-
+           {:range,
+            parse_copy_range(first_header(conn, "x-amz-copy-source-range"), src_meta.size)},
+         {:ok, size, etag} <-
+           Storage.copy_part(root(), src_bucket, src_key, upload_id, n, range) do
+      now = System.system_time(:second)
+      :ok = Index.record_part(upload_id, n, size, etag, now)
+
+      emit(
+        [:multipart, :upload_part_copy],
+        %{size: size, duration: System.monotonic_time(:microsecond) - started},
+        %{upload_id: upload_id, part_number: n, src_bucket: src_bucket, src_key: src_key}
+      )
+
+      send_xml(conn, 200, S3XML.copy_part_result(etag, now))
+    else
+      :error -> error(conn, 400, "InvalidArgument", "partNumber not parseable")
+      false -> error(conn, 400, "InvalidArgument", "partNumber must be 1..10000 or source invalid")
+      {:error, :invalid_copy_source} -> error(conn, 400, "InvalidArgument", "x-amz-copy-source malformed")
+      {:error, :no_such_upload} -> error(conn, 404, "NoSuchUpload", upload_id)
+      {:error, :no_such_key} -> error(conn, 404, "NoSuchKey", "source object does not exist")
+      {:error, :not_found} -> error(conn, 404, "NoSuchKey", "source object missing on disk")
+      {:range, :invalid} -> error(conn, 400, "InvalidArgument", "x-amz-copy-source-range invalid")
+    end
+  end
+
+  defp fetch_src_meta(bucket, key) do
+    case Index.get(bucket, key) do
+      {:ok, meta} -> {:ok, meta}
+      :not_found -> {:error, :no_such_key}
+    end
+  end
+
+  defp fetch_upload(upload_id) do
+    case Index.get_upload(upload_id) do
+      {:ok, u} -> {:ok, u}
+      :not_found -> {:error, :no_such_upload}
+    end
+  end
+
+  defp parse_copy_source(value) when is_binary(value) do
+    trimmed =
+      value
+      |> String.trim_leading("/")
+      |> String.split("?", parts: 2)
+      |> hd()
+
+    case String.split(trimmed, "/", parts: 2) do
+      [bucket, key_enc] when bucket != "" and key_enc != "" ->
+        {:ok, bucket, URI.decode(key_enc)}
+
+      _ ->
+        {:error, :invalid_copy_source}
+    end
+  end
+
+  defp parse_copy_range(nil, _size), do: nil
+  defp parse_copy_range("", _size), do: nil
+
+  defp parse_copy_range(header, size) do
+    case Storage.parse_range(header, size) do
+      {:ok, start, stop} -> {start, stop}
+      :none -> nil
+      :invalid -> :invalid
+    end
+  end
+
   defp do_get(conn, bucket, key) do
     started = System.monotonic_time(:microsecond)
 
@@ -361,8 +486,7 @@ defmodule Kafun.Router do
   defp do_head(conn, bucket, key) do
     case Index.get(bucket, key) do
       :not_found ->
-        # S3 returns 404 with empty body for HEAD; some clients want no XML.
-        send_resp(conn, 404, "")
+        error(conn, 404, "NoSuchKey", key)
 
       {:ok, meta} ->
         conn
@@ -387,6 +511,8 @@ defmodule Kafun.Router do
     prefix = Map.get(qs, "prefix", "")
     delimiter = Map.get(qs, "delimiter")
     max_keys = qs |> Map.get("max-keys", "1000") |> safe_pos_int(1000)
+    encoding_type = Map.get(qs, "encoding-type")
+    fetch_owner? = Map.get(qs, "fetch-owner") == "true"
 
     base_opts = [
       prefix: prefix,
@@ -394,6 +520,8 @@ defmodule Kafun.Router do
       max_keys: max_keys
     ]
 
+    # Per S3 spec: when both continuation-token and start-after are sent,
+    # continuation-token wins and start-after is ignored.
     cursor_opts =
       cond do
         token = Map.get(qs, "continuation-token") ->
@@ -427,7 +555,9 @@ defmodule Kafun.Router do
         entries,
         common_prefixes,
         truncated?,
-        next
+        next,
+        encoding_type: encoding_type,
+        fetch_owner: fetch_owner?
       )
 
     send_xml(conn, 200, body)
@@ -559,6 +689,9 @@ defmodule Kafun.Router do
       not Storage.valid_key?(key) ->
         error(conn, 400, "InvalidArgument", "object key is not valid")
 
+      not Index.bucket_exists?(bucket) ->
+        error(conn, 404, "NoSuchBucket", "bucket does not exist")
+
       true ->
         fun.(conn, bucket, key)
     end
@@ -591,9 +724,17 @@ defmodule Kafun.Router do
   end
 
   defp error(conn, status, code, message) do
-    conn
-    |> put_resp_content_type("application/xml")
-    |> send_resp(status, S3XML.error(code, message, conn.request_path))
+    rid = conn.assigns[:request_id] || ""
+    conn = put_resp_header(conn, "x-amz-error-code", code)
+
+    if conn.method == "HEAD" do
+      # HEAD has no body; the error code rides on the header instead.
+      send_resp(conn, status, "")
+    else
+      conn
+      |> put_resp_content_type("application/xml")
+      |> send_resp(status, S3XML.error(code, message, conn.request_path, rid))
+    end
   end
 
   defp first_header(conn, name) do

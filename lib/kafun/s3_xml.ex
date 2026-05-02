@@ -32,7 +32,11 @@ defmodule Kafun.S3XML do
   the inclusive lower-bound for the next page (encoded into a continuation token)
   or `nil` when not truncated.
   """
-  def list_objects(bucket, prefix, delimiter, max_keys, entries, common_prefixes, truncated?, next) do
+  def list_objects(bucket, prefix, delimiter, max_keys, entries, common_prefixes, truncated?, next, opts \\ []) do
+    encoding_type = Keyword.get(opts, :encoding_type)
+    fetch_owner? = Keyword.get(opts, :fetch_owner, false)
+    enc = if encoding_type == "url", do: &URI.encode/1, else: &Function.identity/1
+
     [
       ~s|<?xml version="1.0" encoding="UTF-8"?>|,
       ~s|<ListBucketResult xmlns="#{@ns}">|,
@@ -40,9 +44,9 @@ defmodule Kafun.S3XML do
       esc(bucket),
       "</Name>",
       "<Prefix>",
-      esc(prefix),
+      esc(enc.(prefix)),
       "</Prefix>",
-      if(delimiter, do: ["<Delimiter>", esc(delimiter), "</Delimiter>"], else: []),
+      if(delimiter, do: ["<Delimiter>", esc(enc.(delimiter)), "</Delimiter>"], else: []),
       "<KeyCount>",
       Integer.to_string(length(entries) + length(common_prefixes)),
       "</KeyCount>",
@@ -52,6 +56,7 @@ defmodule Kafun.S3XML do
       "<IsTruncated>",
       if(truncated?, do: "true", else: "false"),
       "</IsTruncated>",
+      if(encoding_type, do: ["<EncodingType>", esc(encoding_type), "</EncodingType>"], else: []),
       if(truncated? and next,
         do: ["<NextContinuationToken>", token_encode(next), "</NextContinuationToken>"],
         else: []
@@ -60,7 +65,7 @@ defmodule Kafun.S3XML do
         [
           "<Contents>",
           "<Key>",
-          esc(k),
+          esc(enc.(k)),
           "</Key>",
           "<LastModified>",
           iso8601(mt),
@@ -72,11 +77,15 @@ defmodule Kafun.S3XML do
           Integer.to_string(sz),
           "</Size>",
           "<StorageClass>STANDARD</StorageClass>",
+          if(fetch_owner?,
+            do: "<Owner><ID>kafun</ID><DisplayName>kafun</DisplayName></Owner>",
+            else: []
+          ),
           "</Contents>"
         ]
       end),
       Enum.map(common_prefixes, fn cp ->
-        ["<CommonPrefixes><Prefix>", esc(cp), "</Prefix></CommonPrefixes>"]
+        ["<CommonPrefixes><Prefix>", esc(enc.(cp)), "</Prefix></CommonPrefixes>"]
       end),
       "</ListBucketResult>"
     ]
@@ -270,6 +279,38 @@ defmodule Kafun.S3XML do
     end
   end
 
+  @doc "CopyObject response body."
+  @spec copy_object_result(String.t(), integer()) :: iodata()
+  def copy_object_result(etag, last_modified_unix) do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">|,
+      "<LastModified>",
+      iso8601(last_modified_unix),
+      "</LastModified>",
+      "<ETag>&quot;",
+      esc(etag),
+      "&quot;</ETag>",
+      "</CopyObjectResult>"
+    ]
+  end
+
+  @doc "UploadPartCopy response body."
+  @spec copy_part_result(String.t(), integer()) :: iodata()
+  def copy_part_result(etag, last_modified_unix) do
+    [
+      ~s|<?xml version="1.0" encoding="UTF-8"?>|,
+      ~s|<CopyPartResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">|,
+      "<LastModified>",
+      iso8601(last_modified_unix),
+      "</LastModified>",
+      "<ETag>&quot;",
+      esc(etag),
+      "&quot;</ETag>",
+      "</CopyPartResult>"
+    ]
+  end
+
   @doc """
   Parse a Multi-Object Delete request body.
 
@@ -348,8 +389,8 @@ defmodule Kafun.S3XML do
     ]
   end
 
-  @doc "Standard S3 error body."
-  def error(code, message, resource \\ "") do
+  @doc "Standard S3 error body. `request_id` echoes the `x-amz-request-id` header."
+  def error(code, message, resource \\ "", request_id \\ "") do
     [
       ~s|<?xml version="1.0" encoding="UTF-8"?>|,
       "<Error>",
@@ -362,6 +403,12 @@ defmodule Kafun.S3XML do
       "<Resource>",
       esc(resource),
       "</Resource>",
+      "<RequestId>",
+      esc(request_id),
+      "</RequestId>",
+      "<HostId>",
+      esc(request_id),
+      "</HostId>",
       "</Error>"
     ]
   end
