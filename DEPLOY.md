@@ -1,219 +1,188 @@
 # Deploy
 
-Production deployment runbook. Targets a single Void Linux host (yomi)
-fronted by NPM (`objects.harvelab.com`). Service supervision is runit
-(Void's default); openrc/systemd variants will land if/when ACL +
-multi-user work happens.
+Production deployment runbook for kafun on yomi (Void Linux, Docker).
 
-## 1. Build the release on the staging machine
+## What's where
 
-```sh
-git clean -fdx _build/prod                # or `mix deps.clean --all` if deps were tampered with
-MIX_ENV=prod mix deps.get
-MIX_ENV=prod mix release --overwrite
-tar czf kafun-0.1.0.tgz -C _build/prod/rel kafun
-```
+| Path | Owner | Purpose |
+|------|-------|---------|
+| `/srv/kafun/docker-compose.yml` | (you choose) | Compose file. Builds + runs the container. |
+| `/srv/kafun/kafun.env` | (you choose) | Env vars — secrets live here, mode 640. |
+| `/srv/kafun/src/` | (you choose) | Source tree. `compose build` reads from here. Update via `rsync` from your dev box. |
+| `/sanzu/objects/` | (you choose) | ZFS dataset, blob storage + SQLite index. Bind-mounted to `/data` in the container. |
+| `/var/backups/kafun/` | (you choose) | Index snapshots written by the backup cron. |
 
-The tarball is ~70 MB with bundled ERTS — no Erlang/Elixir needed on yomi.
+The "you choose" ownership rows depend on whether you run the container as
+root (matches kavita / booksorter on yomi) or as a specific UID. Either
+works; pick what fits your operational reflex.
 
-## 2. Stage the host (one-time, on yomi)
+## 1. Initial deploy on yomi
 
-```sh
-sudo useradd --system --no-create-home --home-dir /opt/kafun --shell /sbin/nologin kafun
-sudo mkdir -p /opt/kafun /etc/kafun /var/backups/kafun /var/log/kafun /sanzu/objects
-sudo chown -R kafun:kafun /opt/kafun /var/backups/kafun /var/log/kafun /sanzu/objects
-sudo chown root:kafun /etc/kafun
-sudo chmod 750 /etc/kafun
-```
-
-`/sanzu/objects` is the data dir — change to wherever you want
-`KAFUN_ROOT` to point. `/var/log/kafun/` is where svlogd writes the
-service log.
-
-## 3. Ship the release
+Assumes `/srv/kafun/{docker-compose.yml,kafun.env}` and `/srv/kafun/src/`
+already exist (rsync them from a dev checkout — the templates ship in
+this repo at the root).
 
 ```sh
-scp kafun-0.1.0.tgz yomi:/tmp/
-ssh yomi "sudo -u kafun tar xzf /tmp/kafun-0.1.0.tgz -C /opt && rm /tmp/kafun-0.1.0.tgz"
-# Now: /opt/kafun/{bin,erts-*,lib,releases}
+cd /srv/kafun
+
+# Sanity-check the env file. KAFUN_ADMIN_SECRET, KAFUN_KEYS, and
+# RELEASE_COOKIE should all be populated; KAFUN_BOOTSTRAP_BUCKETS should
+# list every bucket clients will push into.
+$EDITOR kafun.env
+
+# Build the image. Multi-stage Alpine; ~45 MB final.
+docker compose build
+
+# Start it.
+docker compose up -d
+
+# Confirm both ports answered:
+docker compose logs --tail=30
+docker compose ps
 ```
 
-## 4. Install the runit service + env file
+Expected log lines (early):
 
-From this repo on yomi (or scp'd):
+```
+kafun starting: root=/data db=/data/index.db bind=0.0.0.0:8333
+Running Kafun.Router with Bandit ...:8333 (http)
+Running Kafun.Admin.Endpoint with Bandit ...:8334 (http)
+kafun bootstrap: ensuring 10 bucket(s)
+```
+
+Smoke-test from the host:
 
 ```sh
-sudo cp -R rel/sv/kafun /etc/sv/kafun
-sudo chown -R root:root /etc/sv/kafun
-sudo chmod 755 /etc/sv/kafun/run /etc/sv/kafun/log/run
-
-sudo cp rel/kafun.env.example /etc/kafun/kafun.env
-sudo chown root:kafun /etc/kafun/kafun.env
-sudo chmod 640 /etc/kafun/kafun.env
-sudo $EDITOR /etc/kafun/kafun.env
-```
-
-Things you **must** edit in `/etc/kafun/kafun.env`:
-
-- `KAFUN_KEYS=` — comma-separated allowed S3 access keys. Generate with
-  `openssl rand -hex 10 | tr 'a-f' 'A-F'`. Empty = auth off (LAN-trusted).
-- `KAFUN_ADMIN_SECRET=` — required in prod. Generate with
-  `openssl rand -base64 64 | tr -d '\n' | head -c 64`. **Set once and
-  leave alone** — rotating it logs every active admin session out.
-- `RELEASE_COOKIE=` — any stable random string. Required for `kafun rpc`
-  to work (used by the backup cron).
-- `KAFUN_ADMIN_PASSWORD=` — leave blank for an open LAN admin UI; set
-  to a real password if NPM ever exposes it more widely.
-
-## 5. Enable and start the service
-
-```sh
-# Symlink into /var/service to start runit supervision.
-sudo ln -s /etc/sv/kafun /var/service/kafun
-
-# Wait a few seconds for runit to pick it up, then:
-sv status kafun
-tail -n 50 /var/log/kafun/current
-```
-
-Expected log lines (svlogd prefixes each with a TAI64N timestamp):
-
-```
-kafun starting: root=/sanzu/objects db=/sanzu/objects/index.db bind=0.0.0.0:8333
-Running Kafun.Router with Bandit 1.11.0 at 0.0.0.0:8333 (http)
-Running Kafun.Admin.Endpoint with Bandit 1.11.0 at 0.0.0.0:8334 (http)
-```
-
-Smoke test from yomi or another LAN box:
-
-```sh
-KEY=<one of KAFUN_KEYS>
+KEY=$(grep ^KAFUN_KEYS /srv/kafun/kafun.env | cut -d= -f2)
 AUTH="AWS4-HMAC-SHA256 Credential=$KEY/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=00"
 curl -sS http://localhost:8333/healthz
-curl -sS -I -H "Authorization: $AUTH" http://localhost:8333/imouto    # → 200 if bucket exists
+curl -sS -I -H "Authorization: $AUTH" http://localhost:8333/wallpapers   # 200 if bootstrap worked
 curl -sS http://localhost:8334/buckets > /dev/null && echo "admin ok"
 ```
 
-## 6. NPM upstream
+## 2. NPM upstream
 
-In nginx-proxy-manager, point `objects.harvelab.com` at `yomi:8333`. If
-you want the admin UI on a separate hostname (recommended), point
-`kafun-admin.harvelab.com` (or similar) at `yomi:8334`. Same NPM machine,
-different upstream entries.
+Point `objects.harvelab.com` at `yomi:8333`. (Same upstream the seaweed
+container used to live behind — no NPM-side change required if you
+already had it set up.) For the admin UI, `kafun-admin.harvelab.com` →
+`yomi:8334` is the recommended pattern; you can also leave admin
+LAN-only and skip an NPM entry.
 
-## 7. Backups
+## 3. Updates
 
-Add a cron entry (as root, `sudo crontab -e`):
+### Code changes
+
+```sh
+# From your dev checkout, push fresh source:
+rsync -avz --delete \
+  --exclude='_build/' --exclude='deps/' --exclude='.git/' \
+  --exclude='.elixir_ls/' --exclude='.lexical/' --exclude='.iex.exs.local' \
+  ./ naka@yomi:/srv/kafun/src/
+
+# On yomi:
+cd /srv/kafun
+docker compose build         # rebuild image
+docker compose up -d         # rolling-style replace
+```
+
+### Env-only changes
+
+```sh
+$EDITOR /srv/kafun/kafun.env
+docker compose up -d         # picks up env_file changes on recreate
+```
+
+## 4. Backups
+
+Daily index snapshot via the release's `rpc` command. Add as root cron
+(`sudo crontab -e`):
 
 ```cron
-# Snapshot the index at 03:00 UTC every day.
-0 3 * * * /opt/kafun/bin/kafun rpc 'Kafun.Backup.run()'
-
-# Prune snapshots older than 14 days.
-30 3 * * * find /var/backups/kafun -name 'kafun-*.db' -mtime +14 -delete
+# Snapshot the index at 03:00 UTC every day, keep 14 days.
+0 3 * * * docker exec kafun /app/bin/kafun rpc 'Kafun.Backup.run("/data/.backups")'
+30 3 * * * find /sanzu/objects/.backups -name 'kafun-*.db' -mtime +14 -delete
 ```
 
-`Kafun.Backup.run/0` writes
-`/var/backups/kafun/kafun-<YYYYMMDD-HHMMSS>.db` via SQLite's
-`VACUUM INTO`. Safe with WAL and a busy DB. The cron entry runs as root;
-the release `rpc` connects to the kafun node by name, so it inherits
-whatever cookie is set in `/etc/kafun/kafun.env`.
+The snapshot lands at `/sanzu/objects/.backups/kafun-<UTC-ts>.db` on
+yomi (because `/data/.backups` inside the container is the
+bind-mounted blob root). The blob tree itself is *not* backed up by
+this — point your existing tool (restic / rsync / borg) at
+`/sanzu/objects` for that. The two stores reconcile on restore: as
+long as both come back, the GC cleans any drift.
 
-The blob tree itself isn't backed up by this — for that, point your
-existing backup tool (restic / rsync / borg) at `/sanzu/objects`. The
-two stores reconcile: as long as you restore both, kafun's GC will
-clean up any drift.
+(Alternative — if you'd prefer the snapshot outside the data dataset —
+bind-mount a second host path into the container and write there. Easy
+edit to `docker-compose.yml`.)
 
-## 8. Migrating from a SeaweedFS deployment
-
-Use the bundled `mix kafun.migrate` task (or its release equivalent —
-see below). It pulls every object from each bucket on the source S3
-endpoint and PUTs them into kafun. Idempotent: re-running only moves
-missing or changed objects.
-
-From a checkout of this repo (anywhere with network access to both ends):
-
-```sh
-mix kafun.migrate \
-  --src https://seaweed.harvelab.com \
-  --src-key BYQ9GQ79ZW0A9XBBWQRL \
-  --src-secret rmqrkge90UwNfY4jezN9a9RpNhA24l7pYxA8ZTeNNu \
-  --dst https://objects.harvelab.com \
-  --dst-key <a key from KAFUN_KEYS on yomi> \
-  --bucket imouto \
-  --concurrency 8
-```
-
-Useful flags:
-
-  --bucket NAME        Migrate one bucket. Omit to enumerate every source bucket.
-  --dry-run            Walk source + count without writing to dst.
-  --verify             HEAD destination after each PUT and confirm size matches.
-  --concurrency N      Parallel object copies (default 8).
-  --max-size BYTES     Skip + warn for objects larger than this (default 4 GiB —
-                       single-shot PUT, no multipart-aware migration).
-
-Resuming an interrupted run is automatic: every per-object copy starts with
-a HEAD on dst and skips if `(size, etag)` already match. Hit Ctrl-C, fix
-whatever, run the same command again.
-
-When the destination bucket should be a different name than the source's
-(e.g. tidying up legacy bucket names mid-migration), pass it as the dst
-argument to the API (`Kafun.Migrate.run(src, dst, "old-name", dst_bucket: "new-name")`)
-or — if doing it from the shell — migrate to the desired name then `aws s3 rb`
-the source bucket on seaweed once verified.
-
-For a one-shot from a yomi where this repo isn't checked out, you can also
-ship a release artefact and use `kafun rpc`:
-
-```sh
-/opt/kafun/bin/kafun rpc \
-  'Kafun.Migrate.run(
-     Kafun.Migrate.client("https://seaweed.harvelab.com", "BYQ...", "rmq..."),
-     Kafun.Migrate.client("http://localhost:8333", "BYQ...", ""),
-     "imouto",
-     concurrency: 8
-   )'
-```
-
-(progress is silent in this mode — check `/var/log/kafun/current` for the
-per-object telemetry).
-
-## 9. Rollback
+## 5. Rollback
 
 If a release is bad:
 
 ```sh
-sudo sv down kafun
-sudo mv /opt/kafun /opt/kafun.bad-$(date +%s)
-sudo -u kafun tar xzf /tmp/kafun-<previous>.tgz -C /opt
-sudo sv up kafun
-sv status kafun && tail /var/log/kafun/current
+cd /srv/kafun
+docker compose down
+
+# Either: re-checkout the prior source on the dev box and rsync it back over,
+# or, if you tag images with a build SHA, re-tag the previous one and
+# `compose up -d`. The simplest homelab flow is the first.
+
+rsync ... # previous source onto /srv/kafun/src/
+docker compose build
+docker compose up -d
 ```
 
-Index DB and blob tree are untouched between releases — only the
-`/opt/kafun/` install dir is replaced. If a bad migration corrupted the
-index, restore the most recent `/var/backups/kafun/kafun-*.db` over
-`KAFUN_ROOT/index.db` while the service is stopped, then bring it back up.
+The blob tree and SQLite index live outside the container on
+`/sanzu/objects/`, so rolling back the image never loses data. If a
+bad migration corrupted the index, restore the most recent
+`/sanzu/objects/.backups/kafun-*.db` to `/sanzu/objects/index.db`
+(stop the container first), then bring it back up.
 
-## 10. Day-2 ops
+## 6. Day-2 ops
 
 | Task | Command |
-| ---- | ------- |
-| Service status | `sv status kafun` |
-| Restart | `sudo sv restart kafun` |
-| Stop (no autostart) | `sudo sv down kafun && sudo touch /etc/sv/kafun/down` |
-| Start | `sudo rm -f /etc/sv/kafun/down && sudo sv up kafun` |
-| Tail current log | `tail -f /var/log/kafun/current` (TAI64N timestamps — pipe through `tai64nlocal` for human-readable) |
-| Last hour | `tail -n 5000 /var/log/kafun/current \| tai64nlocal` |
-| Remote shell | `sudo /opt/kafun/bin/kafun remote` (Ctrl-G then `q` to leave without killing the service) |
-| Trigger GC | `sudo /opt/kafun/bin/kafun rpc 'Kafun.GC.run_now()'` (or click "Run GC now" in the admin UI) |
-| Status | `sudo /opt/kafun/bin/kafun rpc 'Kafun.GC.status()'` |
-| Bucket counts | `sqlite3 -readonly /sanzu/objects/index.db "SELECT bucket, COUNT(*) FROM objects GROUP BY bucket"` |
+|------|---------|
+| Container status | `docker compose ps` |
+| Live logs | `docker compose logs -f --tail=100` |
+| Restart | `docker compose restart` |
+| Stop | `docker compose down` |
+| Start | `docker compose up -d` |
+| Rebuild + apply | `docker compose build && docker compose up -d` |
+| Trigger GC | `docker exec kafun /app/bin/kafun rpc 'Kafun.GC.run_now()'` |
+| GC status | `docker exec kafun /app/bin/kafun rpc 'Kafun.GC.status()'` |
+| Run backup ad hoc | `docker exec kafun /app/bin/kafun rpc 'Kafun.Backup.run("/data/.backups")'` |
+| Remote console | `docker exec -it kafun /app/bin/kafun remote` |
+| Bucket counts | `docker exec kafun /app/bin/sqlite3 -readonly /data/index.db "SELECT bucket, COUNT(*) FROM objects GROUP BY bucket"` (`sqlite3` not currently in image; run from host instead) |
+| Bucket counts (host) | `sqlite3 -readonly /sanzu/objects/index.db "SELECT bucket, COUNT(*) FROM objects GROUP BY bucket"` |
 
-## 11. When the world gets bigger
+## 7. Migrating from another S3 source
 
-If/when ACLs and multi-user land and kafun ships beyond the homelab,
-sibling service definitions for openrc (Alpine VMs) and systemd (anything
-modern) drop into `rel/openrc/` and `rel/systemd/` next to `rel/sv/`. The
-release artifact and env file are unchanged across all three.
+Not part of the initial cutover — we purged seaweed and reconstructed
+from origin pipelines. Tooling stays in the repo for any future
+S3-to-S3 ingest:
+
+```sh
+# From a checkout with deps installed:
+mix kafun.migrate \
+  --src https://other-s3-host \
+  --src-key <ACCESS> \
+  --src-secret <SECRET> \
+  --dst https://objects.harvelab.com \
+  --dst-key <KAFUN_KEY> \
+  --bucket some-bucket \
+  --concurrency 8
+```
+
+Idempotent (HEAD-then-skip on each key); safe to interrupt and resume.
+See `lib/kafun/migrate.ex` and `lib/mix/tasks/kafun.migrate.ex` for
+the full flag list.
+
+## 8. Alternative: bare-metal / runit
+
+If kafun ever moves to its own dedicated Void VM (or any host where
+Docker would be overhead), the `rel/sv/kafun/` runit service +
+`rel/kafun.env.example` cover that path. The release built by
+`MIX_ENV=prod mix release` is self-contained (bundled ERTS); install
+to `/opt/kafun`, drop `kafun.env` at `/etc/kafun/`, symlink the runit
+service into `/var/service/`. The `chpst -u` line in the run script
+becomes the user gate. Tighter, no Docker daemon, but redundant on a
+multi-service box like yomi.

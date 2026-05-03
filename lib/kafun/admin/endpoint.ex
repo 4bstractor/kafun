@@ -21,7 +21,7 @@ defmodule Kafun.Admin.Endpoint do
     at: "/",
     from: :kafun,
     gzip: false,
-    only: ~w(assets favicon.ico)
+    only: ~w(assets favicon.ico favicon.png)
 
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:kafun, :admin]

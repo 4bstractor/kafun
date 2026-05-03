@@ -6,7 +6,7 @@ defmodule Kafun.Admin.ObjectLive do
   use Phoenix.VerifiedRoutes,
     endpoint: Kafun.Admin.Endpoint,
     router: Kafun.Admin.Router,
-    statics: ~w(assets favicon.ico)
+    statics: ~w(assets favicon.ico favicon.png)
 
   alias Kafun.{Index, Storage}
 
@@ -168,11 +168,15 @@ defmodule Kafun.Admin.ObjectLive do
 
   defp image?(_, _), do: false
 
+  # Image previews work by emitting an `<img src=…>` that the *browser*
+  # has to fetch. The browser is some other machine, so we can't use
+  # `localhost`. `KAFUN_PUBLIC_S3_URL` (set in env) is the externally
+  # reachable URL of the S3 surface — typically the public NPM hostname.
+  # When unset we fall back to `KAFUN_HOST:KAFUN_PORT`, which works for
+  # local dev where the browser and the service share a host.
   defp preview_url(bucket, key) do
-    host = Application.get_env(:kafun, :host, "0.0.0.0")
-    host = if host == "0.0.0.0", do: "localhost", else: host
-    port = Application.get_env(:kafun, :port, 8333)
-    base = "http://#{host}:#{port}/#{bucket}/#{URI.encode(key)}"
+    base_url = s3_public_base()
+    base = "#{base_url}/#{bucket}/#{URI.encode(key)}"
 
     case Application.fetch_env!(:kafun, :allowed_keys) do
       %MapSet{} = keys ->
@@ -183,6 +187,19 @@ defmodule Kafun.Admin.ObjectLive do
           [access_key | _] ->
             base <> "?X-Amz-Credential=#{access_key}/admin/us-east-1/s3/aws4_request"
         end
+    end
+  end
+
+  defp s3_public_base do
+    case Application.get_env(:kafun, :public_s3_url) do
+      url when is_binary(url) and url != "" ->
+        String.trim_trailing(url, "/")
+
+      _ ->
+        host = Application.get_env(:kafun, :host, "0.0.0.0")
+        host = if host == "0.0.0.0", do: "localhost", else: host
+        port = Application.get_env(:kafun, :port, 8333)
+        "http://#{host}:#{port}"
     end
   end
 

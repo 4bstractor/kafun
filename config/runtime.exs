@@ -15,12 +15,19 @@ allowed_keys =
   |> String.split(",", trim: true)
   |> MapSet.new()
 
+bootstrap_buckets =
+  System.get_env("KAFUN_BOOTSTRAP_BUCKETS", "")
+  |> String.split(",", trim: true)
+  |> Enum.map(&String.trim/1)
+  |> Enum.reject(&(&1 == ""))
+
 config :kafun,
   root: root,
   db_path: System.get_env("KAFUN_DB") || Path.join(root, "index.db"),
   host: System.get_env("KAFUN_HOST", "0.0.0.0"),
   port: System.get_env("KAFUN_PORT", "8333") |> String.to_integer(),
   allowed_keys: allowed_keys,
+  bootstrap_buckets: bootstrap_buckets,
   gc_interval_ms: System.get_env("KAFUN_GC_INTERVAL_SEC", "3600") |> String.to_integer() |> Kernel.*(1000),
   gc_abandon_after_seconds: System.get_env("KAFUN_GC_ABANDON_AFTER_SEC", "86400") |> String.to_integer(),
   gc_blob_grace_seconds: System.get_env("KAFUN_GC_BLOB_GRACE_SEC", "3600") |> String.to_integer()
@@ -73,4 +80,8 @@ config :kafun, Kafun.Admin.Endpoint,
 
 config :kafun,
   admin_password: System.get_env("KAFUN_ADMIN_PASSWORD"),
-  admin_user: System.get_env("KAFUN_ADMIN_USER", "admin")
+  admin_user: System.get_env("KAFUN_ADMIN_USER", "admin"),
+  # Used by the admin UI's image-preview <img src=…>. Must be reachable
+  # from the operator's browser. Typically the public S3 hostname.
+  # Empty/unset falls back to `KAFUN_HOST:KAFUN_PORT` for local dev.
+  public_s3_url: System.get_env("KAFUN_PUBLIC_S3_URL", "")

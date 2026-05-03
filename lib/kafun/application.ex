@@ -34,7 +34,39 @@ defmodule Kafun.Application do
         []
       end
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: Kafun.Supervisor)
+    result = Supervisor.start_link(children, strategy: :one_for_one, name: Kafun.Supervisor)
+
+    if Application.get_env(:kafun, :start_children?, true) do
+      bootstrap_buckets()
+    end
+
+    result
+  end
+
+  # Pre-create the buckets listed in `KAFUN_BOOTSTRAP_BUCKETS` so a fresh
+  # deployment doesn't have to PUT each one with curl before clients can
+  # push. Idempotent — `ensure_bucket/1` is `INSERT OR IGNORE`, and
+  # `mkdir_p` is happy with an existing dir. Invalid bucket names are
+  # logged and skipped rather than crashing the boot.
+  defp bootstrap_buckets do
+    root = Application.fetch_env!(:kafun, :root)
+
+    case Application.get_env(:kafun, :bootstrap_buckets, []) do
+      [] ->
+        :ok
+
+      names ->
+        Logger.info("kafun bootstrap: ensuring #{length(names)} bucket(s)")
+
+        Enum.each(names, fn name ->
+          if Kafun.Storage.valid_bucket?(name) do
+            :ok = Kafun.Index.ensure_bucket(name)
+            File.mkdir_p!(Path.join(root, name))
+          else
+            Logger.warning("kafun bootstrap: skipping invalid bucket name #{inspect(name)}")
+          end
+        end)
+    end
   end
 
   defp parse_ip("0.0.0.0"), do: {0, 0, 0, 0}

@@ -10,7 +10,7 @@ defmodule Kafun.Admin.StatusLive do
   use Phoenix.VerifiedRoutes,
     endpoint: Kafun.Admin.Endpoint,
     router: Kafun.Admin.Router,
-    statics: ~w(assets favicon.ico)
+    statics: ~w(assets favicon.ico favicon.png)
 
   @events [
     [:kafun, :put, :stop],

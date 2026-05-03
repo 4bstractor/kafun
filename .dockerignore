@@ -1,0 +1,23 @@
+# Build output and deps regenerate inside the container.
+_build/
+deps/
+
+# Editor / language-server caches.
+.elixir_ls/
+.lexical/
+.iex.exs.local
+
+# VCS metadata.
+.git/
+.gitignore
+
+# Tests, docs, and reference material aren't needed in the image.
+test/
+legacy/
+DEPLOY.md
+README.md
+CLAUDE.md
+
+# Don't ship development env files into the image.
+.env
+.envrc

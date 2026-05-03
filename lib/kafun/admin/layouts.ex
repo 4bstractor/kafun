@@ -6,7 +6,7 @@ defmodule Kafun.Admin.Layouts do
   use Phoenix.VerifiedRoutes,
     endpoint: Kafun.Admin.Endpoint,
     router: Kafun.Admin.Router,
-    statics: ~w(assets favicon.ico)
+    statics: ~w(assets favicon.ico favicon.png)
 
   import Phoenix.Controller, only: [get_csrf_token: 0]
 
