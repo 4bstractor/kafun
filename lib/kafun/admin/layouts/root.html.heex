@@ -55,6 +55,29 @@
       .flash { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; }
       .flash-info { background: #1f3a5b; color: #cbd5e1; }
       .flash-error { background: #6e2c2c; color: #fff; }
+      .upload-block { margin: 1rem 0 1.5rem; }
+      .upload-prefix-row { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; }
+      .upload-prefix-row label { color: #8b949e; white-space: nowrap; }
+      .upload-prefix-row input { max-width: 480px; }
+      .dropzone { display: block; padding: 1.4rem 1rem; border: 2px dashed #30363d;
+                   border-radius: 8px; text-align: center; cursor: pointer;
+                   background: #0d1117; transition: border-color 120ms, background 120ms; }
+      .dropzone:hover, .dropzone.phx-drop-active { border-color: #58a6ff; background: #161b22; }
+      .dropzone-headline { font-size: 1rem; color: #c9d1d9; margin-bottom: 0.25rem; }
+      .dropzone-sub { font-size: 0.85rem; color: #8b949e; }
+      .dropzone input[type="file"] { display: none; }
+      .upload-list { margin-top: 0.75rem; }
+      .upload-row { display: grid; grid-template-columns: 1fr 200px 50px 30px;
+                    align-items: center; gap: 0.6rem; padding: 0.35rem 0;
+                    border-bottom: 1px solid #21262d; font-size: 0.9rem; }
+      .upload-name { color: #c9d1d9; overflow: hidden; text-overflow: ellipsis;
+                     white-space: nowrap; }
+      .upload-bar { width: 100%; height: 8px; appearance: none; }
+      .upload-bar::-webkit-progress-bar { background: #21262d; border-radius: 4px; }
+      .upload-bar::-webkit-progress-value { background: #2ea043; border-radius: 4px; }
+      .upload-pct { color: #8b949e; font-variant-numeric: tabular-nums; text-align: right; }
+      .upload-cancel { padding: 0.1rem 0.5rem; line-height: 1; }
+      .upload-err { grid-column: 1 / -1; color: #f85149; font-size: 0.8rem; }
     </style>
     <script defer phx-track-static type="text/javascript" src={~p"/assets/phoenix.js"}></script>
     <script defer phx-track-static type="text/javascript" src={~p"/assets/phoenix_live_view.js"}></script>

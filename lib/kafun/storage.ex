@@ -300,6 +300,38 @@ defmodule Kafun.Storage do
     end
   end
 
+  @doc """
+  Import a local file (typically a Phoenix LiveView upload temp path) into
+  the blob layout. Same atomic temp+rename + inline-MD5 discipline as
+  `stream_put/4` — the result is indistinguishable from a wire-PUT'd
+  object. Returns `{:ok, size, etag}`.
+  """
+  @spec import_file(Path.t(), String.t(), String.t(), Path.t()) ::
+          {:ok, non_neg_integer(), String.t()}
+  def import_file(root, bucket, key, src_path) do
+    final = blob_path(root, bucket, key)
+    File.mkdir_p!(Path.dirname(final))
+    tmp = final <> ".tmp." <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    {:ok, in_fd} = :file.open(src_path, [:read, :raw, :binary, :read_ahead])
+    {:ok, out_fd} = :file.open(tmp, [:write, :raw, :binary, :delayed_write])
+
+    try do
+      {size, ctx} = copy_md5(in_fd, out_fd, 0, :crypto.hash_init(:md5), :infinity)
+      :ok = :file.close(out_fd)
+      :ok = :file.rename(tmp, final)
+      etag = ctx |> :crypto.hash_final() |> Base.encode16(case: :lower)
+      {:ok, size, etag}
+    rescue
+      e ->
+        _ = :file.close(out_fd)
+        _ = :file.delete(tmp)
+        reraise e, __STACKTRACE__
+    after
+      _ = :file.close(in_fd)
+    end
+  end
+
   defp copy_md5(_in_fd, _out_fd, total, ctx, 0), do: {total, ctx}
 
   defp copy_md5(in_fd, out_fd, total, ctx, remaining) do

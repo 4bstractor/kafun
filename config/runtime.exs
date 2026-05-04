@@ -84,4 +84,7 @@ config :kafun,
   # Used by the admin UI's image-preview <img src=…>. Must be reachable
   # from the operator's browser. Typically the public S3 hostname.
   # Empty/unset falls back to `KAFUN_HOST:KAFUN_PORT` for local dev.
-  public_s3_url: System.get_env("KAFUN_PUBLIC_S3_URL", "")
+  public_s3_url: System.get_env("KAFUN_PUBLIC_S3_URL", ""),
+  # Per-file cap for the admin UI drag-and-drop upload, in MiB. Browser-side
+  # rejects files larger than this before they hit the server.
+  admin_max_upload_mb: System.get_env("KAFUN_ADMIN_MAX_UPLOAD_MB", "256") |> String.to_integer()
