@@ -78,6 +78,18 @@
       .upload-pct { color: #8b949e; font-variant-numeric: tabular-nums; text-align: right; }
       .upload-cancel { padding: 0.1rem 0.5rem; line-height: 1; }
       .upload-err { grid-column: 1 / -1; color: #f85149; font-size: 0.8rem; }
+      .row-muted { opacity: 0.55; }
+      .pill-active { color: #2ea043; border-color: #2ea043; }
+      .pill-revoked { color: #f85149; border-color: #6e2c2c; }
+      .btn-link { background: transparent; border: none; padding: 0.1rem 0.3rem;
+                  color: #8b949e; cursor: pointer; }
+      .btn-link:hover { color: #58a6ff; }
+      .generated-key { padding: 1rem 1.25rem; margin-bottom: 1.5rem;
+                       background: #1f2d12; border: 1px solid #2ea043; border-radius: 8px; }
+      .generated-key h2 { margin-top: 0; color: #f0f6fc; }
+      .generated-key code { background: #0d1117; padding: 0.25rem 0.5rem; border-radius: 4px;
+                            font-size: 0.95rem; word-break: break-all; }
+      .generated-warn { color: #ffa657; font-size: 0.9rem; margin: 0.5rem 0 1rem; }
     </style>
     <script defer phx-track-static type="text/javascript" src={~p"/assets/phoenix.js"}></script>
     <script defer phx-track-static type="text/javascript" src={~p"/assets/phoenix_live_view.js"}></script>
@@ -97,6 +109,7 @@
       <nav class="row">
         <.link navigate={~p"/buckets"}>Buckets</.link>
         <.link navigate={~p"/uploads"}>Uploads</.link>
+        <.link navigate={~p"/keys"}>Keys</.link>
         <.link navigate={~p"/status"}>Status</.link>
       </nav>
     </header>
