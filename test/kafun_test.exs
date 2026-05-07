@@ -203,11 +203,22 @@ defmodule KafunTest do
     @fixed_now ~U[2026-05-05 12:00:00Z]
 
     setup do
+      # Test env defaults `auth_disabled?: true` so existing unsigned-conn
+      # tests keep working. This describe block is the gate's own tests —
+      # it needs to enforce auth to actually validate behavior.
+      previous = Application.get_env(:kafun, :auth_disabled?, false)
+      Application.put_env(:kafun, :auth_disabled?, false)
+
       tmp = Path.join(System.tmp_dir!(), "kafun-authgate-#{System.unique_integer([:positive])}")
       File.mkdir_p!(tmp)
       db = Path.join(tmp, "index.db")
       start_supervised!({Index, db_path: db})
-      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      on_exit(fn ->
+        Application.put_env(:kafun, :auth_disabled?, previous)
+        File.rm_rf!(tmp)
+      end)
+
       :ok
     end
 
@@ -388,6 +399,207 @@ defmodule KafunTest do
       :ok = Index.upsert_grant("KEY11", "*", :read)
       bs = Auth.accessible_buckets("KEY11") |> Enum.sort()
       assert bs == ["a-public", "b-private", "c-private"]
+    end
+  end
+
+  describe "Router auth gate integration" do
+    alias Kafun.Auth.SigV4
+
+    @fixed_now ~U[2026-05-05 12:00:00Z]
+
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-router-auth-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+
+      # Disable the test escape hatch for THIS describe block — we want the
+      # real gate to fire so we can validate the wiring.
+      previous = Application.get_env(:kafun, :auth_disabled?, false)
+      Application.put_env(:kafun, :auth_disabled?, false)
+
+      start_supervised!({Index, db_path: db})
+
+      on_exit(fn ->
+        Application.put_env(:kafun, :auth_disabled?, previous)
+        File.rm_rf!(tmp)
+      end)
+
+      %{root: tmp}
+    end
+
+    defp signed_router_conn(method, path, opts) do
+      url = "http://www.example.com#{path}"
+      payload = Keyword.get(opts, :payload, {:hash, ""})
+
+      headers =
+        SigV4.sign(method, url, [],
+          access_key: Keyword.fetch!(opts, :access_key),
+          secret_key: Keyword.fetch!(opts, :secret_key),
+          payload: payload,
+          now: Keyword.get(opts, :now, @fixed_now)
+        )
+
+      conn = Plug.Test.conn(method, path, "")
+
+      Enum.reduce(headers, conn, fn {k, v}, c ->
+        name = String.downcase(k)
+
+        if name == "host" do
+          %{c | req_headers: [{"host", v} | c.req_headers]}
+        else
+          Plug.Conn.put_req_header(c, name, v)
+        end
+      end)
+    end
+
+    test "anonymous GET on a private bucket returns 403 AccessDenied" do
+      :ok = Index.ensure_bucket("private-b")
+
+      conn = Plug.Test.conn(:get, "/private-b") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 403
+      assert conn.resp_body =~ "AccessDenied"
+    end
+
+    test "anonymous GET on a public-read bucket succeeds" do
+      :ok = Index.ensure_bucket("public-b")
+      :ok = Index.set_bucket_public_read("public-b", true)
+
+      conn =
+        Plug.Test.conn(:get, "/public-b?list-type=2") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "anonymous PUT on a public-read bucket is still 403 (writes never anonymous)" do
+      :ok = Index.ensure_bucket("public-b")
+      :ok = Index.set_bucket_public_read("public-b", true)
+
+      conn =
+        Plug.Test.conn(:put, "/public-b/k", "x") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 403
+    end
+
+    test "signed GET with a read grant succeeds" do
+      :ok = Index.ensure_bucket("test-bucket")
+      :ok = Index.create_access_key("READER", "secret", "")
+      :ok = Index.upsert_grant("READER", "test-bucket", :read)
+
+      conn =
+        signed_router_conn(:get, "/test-bucket?list-type=2",
+          access_key: "READER",
+          secret_key: "secret"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "signed PUT object with only a :read grant is 403 forbidden" do
+      :ok = Index.ensure_bucket("test-bucket")
+      :ok = Index.create_access_key("READER", "secret", "")
+      :ok = Index.upsert_grant("READER", "test-bucket", :read)
+
+      conn =
+        signed_router_conn(:put, "/test-bucket/k",
+          access_key: "READER",
+          secret_key: "secret",
+          payload: {:hash, ""}
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 403
+      assert conn.resp_body =~ "AccessDenied"
+    end
+
+    test "signed PUT with a :write grant succeeds" do
+      :ok = Index.ensure_bucket("test-bucket")
+      :ok = Index.create_access_key("WRITER", "secret", "")
+      :ok = Index.upsert_grant("WRITER", "test-bucket", :write)
+
+      conn =
+        signed_router_conn(:put, "/test-bucket/k",
+          access_key: "WRITER",
+          secret_key: "secret",
+          payload: {:hash, ""}
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "CreateBucket without a global admin grant is 403" do
+      :ok = Index.create_access_key("LOCAL_ADMIN", "secret", "")
+      :ok = Index.upsert_grant("LOCAL_ADMIN", "specific", :admin)
+
+      conn =
+        signed_router_conn(:put, "/new-bucket",
+          access_key: "LOCAL_ADMIN",
+          secret_key: "secret"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 403
+    end
+
+    test "CreateBucket with a global admin grant succeeds" do
+      :ok = Index.create_access_key("GLOBAL_ADMIN", "secret", "")
+      :ok = Index.upsert_grant("GLOBAL_ADMIN", "*", :admin)
+
+      conn =
+        signed_router_conn(:put, "/new-bucket",
+          access_key: "GLOBAL_ADMIN",
+          secret_key: "secret"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "ListAllMyBuckets returns only buckets the caller can access" do
+      :ok = Index.ensure_bucket("granted")
+      :ok = Index.ensure_bucket("denied")
+      :ok = Index.create_access_key("LIMITED", "secret", "")
+      :ok = Index.upsert_grant("LIMITED", "granted", :read)
+
+      conn =
+        signed_router_conn(:get, "/", access_key: "LIMITED", secret_key: "secret")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<Name>granted</Name>"
+      refute conn.resp_body =~ "<Name>denied</Name>"
+    end
+
+    test "env-bootstrapped key with empty secret and global admin works without sig verification" do
+      :ok = Index.ensure_bucket("any")
+      :ok = Index.create_access_key("ENV_KEY", "", "env-bootstrap")
+      :ok = Index.upsert_grant("ENV_KEY", "*", :admin)
+
+      # Sign with a bogus secret — verifier sees :empty_secret and skips check.
+      conn =
+        signed_router_conn(:get, "/any?list-type=2",
+          access_key: "ENV_KEY",
+          secret_key: "anything"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "revoked key returns 403 InvalidAccessKeyId" do
+      :ok = Index.ensure_bucket("test-bucket")
+      :ok = Index.create_access_key("DEAD", "secret", "")
+      :ok = Index.upsert_grant("DEAD", "*", :admin)
+      :ok = Index.revoke_access_key("DEAD")
+
+      conn =
+        signed_router_conn(:get, "/test-bucket", access_key: "DEAD", secret_key: "secret")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 403
+      assert conn.resp_body =~ "InvalidAccessKeyId"
     end
   end
 

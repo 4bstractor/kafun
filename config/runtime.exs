@@ -36,6 +36,14 @@ if level = System.get_env("KAFUN_LOG_LEVEL") do
   config :logger, level: String.to_atom(level)
 end
 
+# Set `auth_disabled?` only when KAFUN_AUTH_DISABLED is explicitly present.
+# Otherwise leave it to compile-time config (config/test.exs sets true so
+# unsigned-conn tests keep working). Default for prod (env unset) is the
+# enforced state.
+if val = System.get_env("KAFUN_AUTH_DISABLED") do
+  config :kafun, auth_disabled?: String.downcase(val) in ["1", "true", "yes"]
+end
+
 ## Admin UI runtime config.
 
 admin_secret =

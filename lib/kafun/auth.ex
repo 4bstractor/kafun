@@ -108,20 +108,32 @@ defmodule Kafun.Auth do
   """
   @spec authorize(Plug.Conn.t(), keyword()) :: :ok | {:error, reason()}
   def authorize(conn, opts) do
-    action = Keyword.fetch!(opts, :action)
-    bucket = Keyword.fetch!(opts, :bucket)
+    if auth_disabled?() do
+      :ok
+    else
+      action = Keyword.fetch!(opts, :action)
+      bucket = Keyword.fetch!(opts, :bucket)
 
-    case SigV4.verify(conn, &lookup_secret/1) do
-      {:ok, _verified_or_unverified, key_id} ->
-        check_grant(key_id, bucket, action)
+      case SigV4.verify(conn, &lookup_secret/1) do
+        {:ok, _verified_or_unverified, key_id} ->
+          check_grant(key_id, bucket, action)
 
-      {:error, :no_credentials} ->
-        check_anonymous(bucket, action)
+        {:error, :no_credentials} ->
+          check_anonymous(bucket, action)
 
-      {:error, _} = err ->
-        err
+        {:error, _} = err ->
+          err
+      end
     end
   end
+
+  @doc """
+  Test/operator escape hatch — returns true when `KAFUN_AUTH_DISABLED=true`.
+  Default is false. Set in `config/test.exs` so existing unsigned-conn tests
+  keep passing; in production, the operator can flip it temporarily for
+  recovery scenarios (locked out of admin, key rotation gone wrong).
+  """
+  def auth_disabled?, do: Application.get_env(:kafun, :auth_disabled?, false)
 
   @doc """
   Same as `authorize/2` but at the *service* level (no bucket — e.g. ListAllMyBuckets,
@@ -133,6 +145,14 @@ defmodule Kafun.Auth do
   def authorize_service(conn, opts) do
     action = Keyword.fetch!(opts, :action)
 
+    if auth_disabled?() do
+      {:ok, :anonymous}
+    else
+      authorize_service_real(conn, action)
+    end
+  end
+
+  defp authorize_service_real(conn, action) do
     case SigV4.verify(conn, &lookup_secret/1) do
       {:ok, _, key_id} ->
         case action do
