@@ -78,12 +78,27 @@ end
   |> String.to_charlist()
   |> :inet.parse_address()
 
+# Origins allowed to open the LiveView websocket. Comma-separated.
+# Empty disables origin checking entirely (LAN-trusted; recommended for
+# homelab + NPM front). Specify e.g.
+#   KAFUN_ADMIN_ALLOWED_ORIGINS=https://kafun.harvelab.com,http://yomi:8334
+# to lock it down.
+admin_check_origin =
+  case System.get_env("KAFUN_ADMIN_ALLOWED_ORIGINS", "") do
+    "" ->
+      false
+
+    raw ->
+      raw |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
+  end
+
 config :kafun, Kafun.Admin.Endpoint,
   http: [
     ip: admin_ip,
     port: System.get_env("KAFUN_ADMIN_PORT", "8334") |> String.to_integer()
   ],
   secret_key_base: admin_secret,
+  check_origin: admin_check_origin,
   server: Application.get_env(:kafun, :start_children?, true)
 
 config :kafun,
