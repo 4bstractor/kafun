@@ -103,7 +103,12 @@ defmodule Kafun.Admin.BucketsLive do
         <tbody>
           <%= for b <- @buckets do %>
             <tr>
-              <td><.link navigate={~p"/buckets/#{b.name}"}>{b.name}</.link></td>
+              <td>
+                <.link navigate={~p"/buckets/#{b.name}"}>{b.name}</.link>
+                <%= if b.public_read do %>
+                  <span class="pill pill-public" title="Public read access enabled">🌐 public</span>
+                <% end %>
+              </td>
               <td>{format_date(b.created_at)}</td>
               <td class="num">{b.object_count}</td>
               <td class="num">{humanize_bytes(b.total_bytes)}</td>

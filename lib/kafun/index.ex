@@ -51,7 +51,15 @@ defmodule Kafun.Index do
   buckets index. One scan over `objects` grouped by bucket; fine at homelab
   scale (sqlite handles a few million rows in milliseconds).
   """
-  @spec bucket_stats() :: [%{name: String.t(), object_count: non_neg_integer(), total_bytes: non_neg_integer(), created_at: integer()}]
+  @spec bucket_stats() :: [
+          %{
+            name: String.t(),
+            object_count: non_neg_integer(),
+            total_bytes: non_neg_integer(),
+            created_at: integer(),
+            public_read: boolean()
+          }
+        ]
   def bucket_stats, do: GenServer.call(@name, :bucket_stats)
 
   @spec bucket_exists?(String.t()) :: boolean()
@@ -401,7 +409,8 @@ defmodule Kafun.Index do
         SELECT b.name,
                b.created_at,
                COALESCE((SELECT COUNT(*) FROM objects WHERE bucket = b.name), 0),
-               COALESCE((SELECT SUM(size) FROM objects WHERE bucket = b.name), 0)
+               COALESCE((SELECT SUM(size) FROM objects WHERE bucket = b.name), 0),
+               b.public_read
         FROM buckets b ORDER BY b.name
         """),
       bucket_exists: prep(conn, "SELECT 1 FROM buckets WHERE name = ? LIMIT 1"),
@@ -575,8 +584,14 @@ defmodule Kafun.Index do
     rows = fetch_all(state, :bucket_stats, [])
 
     out =
-      Enum.map(rows, fn [n, ts, count, bytes] ->
-        %{name: n, created_at: ts, object_count: count, total_bytes: bytes || 0}
+      Enum.map(rows, fn [n, ts, count, bytes, public_read] ->
+        %{
+          name: n,
+          created_at: ts,
+          object_count: count,
+          total_bytes: bytes || 0,
+          public_read: public_read == 1
+        }
       end)
 
     {:reply, out, state}
