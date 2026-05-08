@@ -38,9 +38,45 @@ defmodule Kafun.Application do
 
     if Application.get_env(:kafun, :start_children?, true) do
       bootstrap_buckets()
+      bootstrap_env_keys()
     end
 
     result
+  end
+
+  # Migrate KAFUN_KEYS env entries into the access_keys table on first boot
+  # (idempotent on subsequent boots). Each env key gets:
+  #
+  #   * a row in access_keys with empty secret (legacy unverified mode)
+  #   * a global admin grant (`bucket_grants(<key>, "*", "admin")`)
+  #
+  # That preserves pre-ACL behavior — env keys keep skipping signature
+  # verification and have full access. Operators can rotate to a real
+  # secret via the admin UI to opt into SigV4 verification, or revoke
+  # the env-bootstrapped key entirely once new keys are in place.
+  defp bootstrap_env_keys do
+    keys = Application.fetch_env!(:kafun, :allowed_keys)
+
+    case MapSet.size(keys) do
+      0 ->
+        :ok
+
+      n ->
+        Logger.info("kafun bootstrap: ensuring #{n} env-key access record(s)")
+
+        Enum.each(keys, fn key_id ->
+          case Kafun.Index.get_access_key(key_id) do
+            :not_found ->
+              :ok = Kafun.Index.create_access_key(key_id, "", "env-bootstrap (KAFUN_KEYS)")
+              :ok = Kafun.Index.upsert_grant(key_id, "*", :admin)
+
+            {:ok, _} ->
+              # Already in DB — leave alone. Operator may have rotated the
+              # secret; we don't want to clobber their grants either.
+              :ok
+          end
+        end)
+    end
   end
 
   # Pre-create the buckets listed in `KAFUN_BOOTSTRAP_BUCKETS` so a fresh

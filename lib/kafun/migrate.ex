@@ -15,7 +15,7 @@ defmodule Kafun.Migrate do
   """
 
   require Logger
-  alias Kafun.Migrate.SigV4
+  alias Kafun.Auth.SigV4
 
   defstruct [:endpoint, :access_key, :secret_key, :region]
 

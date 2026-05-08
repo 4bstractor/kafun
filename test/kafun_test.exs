@@ -3,8 +3,8 @@ defmodule KafunTest do
 
   alias Kafun.{GC, Index, Multipart, Storage, S3XML}
 
-  describe "Migrate.SigV4" do
-    alias Kafun.Migrate.SigV4
+  describe "Auth.SigV4 (signing)" do
+    alias Kafun.Auth.SigV4
 
     @fixed_now ~U[2026-05-02 12:00:00Z]
 
@@ -64,6 +64,543 @@ defmodule KafunTest do
     end
 
     defp auth_of(headers), do: Enum.find_value(headers, fn {k, v} -> if k == "authorization", do: v end)
+  end
+
+  describe "Auth.SigV4 (verifying)" do
+    alias Kafun.Auth.SigV4
+
+    @fixed_now ~U[2026-05-05 12:00:00Z]
+
+    # Build a conn that mimics what Bandit hands Plug for a freshly-signed request.
+    # Plug.Test defaults conn.host to "www.example.com"; we sign against the
+    # same host so the canonical request matches.
+    defp signed_conn(method, path, query, body, opts) do
+      url = "http://www.example.com#{path}#{if query == "", do: "", else: "?" <> query}"
+      payload = Keyword.get(opts, :payload, {:hash, body || ""})
+
+      headers =
+        SigV4.sign(method, url, [],
+          access_key: Keyword.fetch!(opts, :access_key),
+          secret_key: Keyword.fetch!(opts, :secret_key),
+          payload: payload,
+          now: Keyword.get(opts, :now, @fixed_now)
+        )
+
+      conn = Plug.Test.conn(method, path <> if(query == "", do: "", else: "?" <> query), body || "")
+
+      # `Plug.Conn.put_req_header` refuses "host"; bypass via struct mutation
+      # for that one header (Bandit puts it in req_headers in production).
+      Enum.reduce(headers, conn, fn {k, v}, c ->
+        name = String.downcase(k)
+
+        if name == "host" do
+          %{c | req_headers: [{"host", v} | c.req_headers]}
+        else
+          Plug.Conn.put_req_header(c, name, v)
+        end
+      end)
+    end
+
+    defp lookup(known) do
+      fn id ->
+        case Map.fetch(known, id) do
+          :error -> :not_found
+          {:ok, :revoked} -> :revoked
+          {:ok, :empty} -> :empty_secret
+          {:ok, secret} when is_binary(secret) -> {:ok, secret}
+        end
+      end
+    end
+
+    test "verify accepts a freshly-signed request with the matching secret" do
+      conn = signed_conn(:get, "/wallpapers", "", "",
+        access_key: "AKID0", secret_key: "supersecret"
+      )
+
+      assert {:ok, :verified, "AKID0"} = SigV4.verify(conn, lookup(%{"AKID0" => "supersecret"}))
+    end
+
+    test "verify rejects when secret is wrong" do
+      conn = signed_conn(:get, "/wallpapers", "", "",
+        access_key: "AKID1", secret_key: "actual-secret"
+      )
+
+      assert {:error, :invalid_signature} =
+               SigV4.verify(conn, lookup(%{"AKID1" => "wrong-secret"}))
+    end
+
+    test "verify rejects when the request body or headers were tampered after signing" do
+      conn = signed_conn(:put, "/b/k", "", "original",
+        access_key: "AKID2", secret_key: "s"
+      )
+
+      # Mutate a signed header to simulate tampering.
+      tampered = Plug.Conn.put_req_header(conn, "x-amz-date", "19700101T000000Z")
+
+      assert {:error, :invalid_signature} = SigV4.verify(tampered, lookup(%{"AKID2" => "s"}))
+    end
+
+    test "verify returns :unknown_key when the access key isn't in the lookup" do
+      conn = signed_conn(:get, "/b", "", "",
+        access_key: "AKID-UNKNOWN", secret_key: "x"
+      )
+
+      assert {:error, :unknown_key} = SigV4.verify(conn, lookup(%{}))
+    end
+
+    test "verify returns :revoked_key on a revoked-key sentinel" do
+      conn = signed_conn(:get, "/b", "", "", access_key: "AKID-DEAD", secret_key: "x")
+
+      assert {:error, :revoked_key} =
+               SigV4.verify(conn, lookup(%{"AKID-DEAD" => :revoked}))
+    end
+
+    test "verify returns :unverified for the legacy empty-secret bootstrap path" do
+      # Sign with any old secret — verify shouldn't even check it because
+      # the lookup returns :empty_secret.
+      conn = signed_conn(:get, "/b", "", "", access_key: "ENV-KEY", secret_key: "ignored")
+
+      assert {:ok, :unverified, "ENV-KEY"} =
+               SigV4.verify(conn, lookup(%{"ENV-KEY" => :empty}))
+    end
+
+    test "verify returns :no_credentials when there's no auth header or querystring" do
+      conn = Plug.Test.conn(:get, "/b")
+      assert {:error, :no_credentials} = SigV4.verify(conn, lookup(%{}))
+    end
+
+    test "verify rejects streaming-signed payloads" do
+      conn = signed_conn(:put, "/b/k", "", "body", access_key: "K", secret_key: "S")
+
+      streamed =
+        Plug.Conn.put_req_header(
+          conn,
+          "x-amz-content-sha256",
+          "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        )
+
+      assert {:error, :stream_signed_payload} =
+               SigV4.verify(streamed, lookup(%{"K" => "S"}))
+    end
+
+    test "verify accepts a request with querystring credentials as :unverified" do
+      # Mirrors the admin UI's image-preview trick.
+      conn =
+        Plug.Test.conn(
+          :get,
+          "/wallpapers/foo.png?X-Amz-Credential=AKID0/admin/us-east-1/s3/aws4_request"
+        )
+
+      assert {:ok, :unverified, "AKID0"} =
+               SigV4.verify(conn, lookup(%{"AKID0" => "supersecret"}))
+    end
+  end
+
+  describe "Auth.authorize/2 (gate)" do
+    alias Kafun.Auth
+    alias Kafun.Auth.SigV4
+
+    @fixed_now ~U[2026-05-05 12:00:00Z]
+
+    setup do
+      # Test env defaults `auth_disabled?: true` so existing unsigned-conn
+      # tests keep working. This describe block is the gate's own tests —
+      # it needs to enforce auth to actually validate behavior.
+      previous = Application.get_env(:kafun, :auth_disabled?, false)
+      Application.put_env(:kafun, :auth_disabled?, false)
+
+      tmp = Path.join(System.tmp_dir!(), "kafun-authgate-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      start_supervised!({Index, db_path: db})
+
+      on_exit(fn ->
+        Application.put_env(:kafun, :auth_disabled?, previous)
+        File.rm_rf!(tmp)
+      end)
+
+      :ok
+    end
+
+    defp signed_conn_for(method, path, opts) do
+      url = "http://www.example.com#{path}"
+      payload = Keyword.get(opts, :payload, {:hash, ""})
+
+      headers =
+        SigV4.sign(method, url, [],
+          access_key: Keyword.fetch!(opts, :access_key),
+          secret_key: Keyword.fetch!(opts, :secret_key),
+          payload: payload,
+          now: Keyword.get(opts, :now, @fixed_now)
+        )
+
+      conn = Plug.Test.conn(method, path, "")
+
+      Enum.reduce(headers, conn, fn {k, v}, c ->
+        name = String.downcase(k)
+
+        if name == "host" do
+          %{c | req_headers: [{"host", v} | c.req_headers]}
+        else
+          Plug.Conn.put_req_header(c, name, v)
+        end
+      end)
+    end
+
+    test "authenticated read with read grant succeeds" do
+      :ok = Index.create_access_key("KEY1", "secret", "")
+      :ok = Index.upsert_grant("KEY1", "wallpapers", :read)
+      :ok = Index.ensure_bucket("wallpapers")
+
+      conn = signed_conn_for(:get, "/wallpapers", access_key: "KEY1", secret_key: "secret")
+      assert :ok = Auth.authorize(conn, action: :read, bucket: "wallpapers")
+    end
+
+    test "read grant is insufficient for write action" do
+      :ok = Index.create_access_key("KEY2", "secret", "")
+      :ok = Index.upsert_grant("KEY2", "b", :read)
+
+      conn = signed_conn_for(:put, "/b/k", access_key: "KEY2", secret_key: "secret")
+      assert {:error, :forbidden} = Auth.authorize(conn, action: :write, bucket: "b")
+    end
+
+    test "write grant satisfies read and write but not admin" do
+      :ok = Index.create_access_key("KEY3", "secret", "")
+      :ok = Index.upsert_grant("KEY3", "b", :write)
+
+      conn_r = signed_conn_for(:get, "/b", access_key: "KEY3", secret_key: "secret")
+      assert :ok = Auth.authorize(conn_r, action: :read, bucket: "b")
+
+      conn_w = signed_conn_for(:put, "/b/k", access_key: "KEY3", secret_key: "secret")
+      assert :ok = Auth.authorize(conn_w, action: :write, bucket: "b")
+
+      conn_a = signed_conn_for(:delete, "/b", access_key: "KEY3", secret_key: "secret")
+      assert {:error, :forbidden} = Auth.authorize(conn_a, action: :admin, bucket: "b")
+    end
+
+    test "admin grant satisfies all actions" do
+      :ok = Index.create_access_key("KEY4", "secret", "")
+      :ok = Index.upsert_grant("KEY4", "b", :admin)
+
+      for action <- [:read, :write, :admin] do
+        method = if action == :read, do: :get, else: :put
+        conn = signed_conn_for(method, "/b", access_key: "KEY4", secret_key: "secret")
+        assert :ok = Auth.authorize(conn, action: action, bucket: "b")
+      end
+    end
+
+    test "global '*' grant covers buckets that lack a specific grant" do
+      :ok = Index.create_access_key("KEY5", "secret", "")
+      :ok = Index.upsert_grant("KEY5", "*", :write)
+
+      conn = signed_conn_for(:put, "/random-bucket/k", access_key: "KEY5", secret_key: "secret")
+      assert :ok = Auth.authorize(conn, action: :write, bucket: "random-bucket")
+    end
+
+    test "anonymous + public bucket + :read → :ok" do
+      :ok = Index.ensure_bucket("public-pile")
+      :ok = Index.set_bucket_public_read("public-pile", true)
+
+      conn = Plug.Test.conn(:get, "/public-pile/k")
+      assert :ok = Auth.authorize(conn, action: :read, bucket: "public-pile")
+    end
+
+    test "anonymous + public bucket + :write → :unauthenticated" do
+      :ok = Index.ensure_bucket("public-pile")
+      :ok = Index.set_bucket_public_read("public-pile", true)
+
+      conn = Plug.Test.conn(:put, "/public-pile/k")
+      assert {:error, :unauthenticated} = Auth.authorize(conn, action: :write, bucket: "public-pile")
+    end
+
+    test "anonymous + private bucket → :unauthenticated" do
+      :ok = Index.ensure_bucket("private-pile")
+      conn = Plug.Test.conn(:get, "/private-pile/k")
+      assert {:error, :unauthenticated} = Auth.authorize(conn, action: :read, bucket: "private-pile")
+    end
+
+    test "unknown key in the credential → :unknown_key" do
+      conn = signed_conn_for(:get, "/b", access_key: "GHOST", secret_key: "x")
+      assert {:error, :unknown_key} = Auth.authorize(conn, action: :read, bucket: "b")
+    end
+
+    test "revoked key → :revoked_key" do
+      :ok = Index.create_access_key("KEY6", "secret", "")
+      :ok = Index.revoke_access_key("KEY6")
+
+      conn = signed_conn_for(:get, "/b", access_key: "KEY6", secret_key: "secret")
+      assert {:error, :revoked_key} = Auth.authorize(conn, action: :read, bucket: "b")
+    end
+
+    test "invalid signature (wrong secret on client side) → :invalid_signature" do
+      :ok = Index.create_access_key("KEY7", "real-secret", "")
+      :ok = Index.upsert_grant("KEY7", "b", :read)
+
+      conn = signed_conn_for(:get, "/b", access_key: "KEY7", secret_key: "wrong-client-secret")
+      assert {:error, :invalid_signature} = Auth.authorize(conn, action: :read, bucket: "b")
+    end
+
+    test "streaming-signed payload header → :stream_signed_payload" do
+      :ok = Index.create_access_key("KEY8", "s", "")
+      :ok = Index.upsert_grant("KEY8", "b", :write)
+
+      conn =
+        signed_conn_for(:put, "/b/k", access_key: "KEY8", secret_key: "s")
+        |> Plug.Conn.put_req_header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+
+      assert {:error, :stream_signed_payload} =
+               Auth.authorize(conn, action: :write, bucket: "b")
+    end
+
+    test "empty-secret legacy key with a grant → :ok (signature skipped)" do
+      :ok = Index.create_access_key("ENV-KEY", "", "env bootstrap")
+      :ok = Index.upsert_grant("ENV-KEY", "*", :admin)
+
+      conn = signed_conn_for(:get, "/anywhere", access_key: "ENV-KEY", secret_key: "anything")
+      assert :ok = Auth.authorize(conn, action: :read, bucket: "anywhere")
+    end
+
+    test "authorize_service :list_buckets allows anonymous and any key" do
+      conn_anon = Plug.Test.conn(:get, "/")
+      assert {:ok, :anonymous} = Auth.authorize_service(conn_anon, action: :list_buckets)
+
+      :ok = Index.create_access_key("KEY9", "s", "")
+      conn_keyed = signed_conn_for(:get, "/", access_key: "KEY9", secret_key: "s")
+      assert {:ok, "KEY9"} = Auth.authorize_service(conn_keyed, action: :list_buckets)
+    end
+
+    test "authorize_service :create_bucket requires a global admin grant" do
+      :ok = Index.create_access_key("KEY10", "s", "")
+      :ok = Index.upsert_grant("KEY10", "specific", :admin)
+
+      conn = signed_conn_for(:put, "/new-bucket", access_key: "KEY10", secret_key: "s")
+      # specific bucket admin doesn't suffice for CreateBucket
+      assert {:error, :forbidden} = Auth.authorize_service(conn, action: :create_bucket)
+
+      :ok = Index.upsert_grant("KEY10", "*", :admin)
+      assert {:ok, "KEY10"} = Auth.authorize_service(conn, action: :create_bucket)
+    end
+
+    test "accessible_buckets returns the right scope per caller" do
+      :ok = Index.ensure_bucket("a-public")
+      :ok = Index.set_bucket_public_read("a-public", true)
+      :ok = Index.ensure_bucket("b-private")
+      :ok = Index.ensure_bucket("c-private")
+
+      # Anonymous: only the public one.
+      assert ["a-public"] = Auth.accessible_buckets(:anonymous)
+
+      # Specific-bucket grants for a key.
+      :ok = Index.create_access_key("KEY11", "s", "")
+      :ok = Index.upsert_grant("KEY11", "b-private", :read)
+      assert ["b-private"] = Auth.accessible_buckets("KEY11")
+
+      # Global '*' grant: every bucket.
+      :ok = Index.upsert_grant("KEY11", "*", :read)
+      bs = Auth.accessible_buckets("KEY11") |> Enum.sort()
+      assert bs == ["a-public", "b-private", "c-private"]
+    end
+  end
+
+  describe "Router auth gate integration" do
+    alias Kafun.Auth.SigV4
+
+    @fixed_now ~U[2026-05-05 12:00:00Z]
+
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-router-auth-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      Application.put_env(:kafun, :root, tmp)
+
+      # Disable the test escape hatch for THIS describe block — we want the
+      # real gate to fire so we can validate the wiring.
+      previous = Application.get_env(:kafun, :auth_disabled?, false)
+      Application.put_env(:kafun, :auth_disabled?, false)
+
+      start_supervised!({Index, db_path: db})
+
+      on_exit(fn ->
+        Application.put_env(:kafun, :auth_disabled?, previous)
+        File.rm_rf!(tmp)
+      end)
+
+      %{root: tmp}
+    end
+
+    defp signed_router_conn(method, path, opts) do
+      url = "http://www.example.com#{path}"
+      payload = Keyword.get(opts, :payload, {:hash, ""})
+
+      headers =
+        SigV4.sign(method, url, [],
+          access_key: Keyword.fetch!(opts, :access_key),
+          secret_key: Keyword.fetch!(opts, :secret_key),
+          payload: payload,
+          now: Keyword.get(opts, :now, @fixed_now)
+        )
+
+      conn = Plug.Test.conn(method, path, "")
+
+      Enum.reduce(headers, conn, fn {k, v}, c ->
+        name = String.downcase(k)
+
+        if name == "host" do
+          %{c | req_headers: [{"host", v} | c.req_headers]}
+        else
+          Plug.Conn.put_req_header(c, name, v)
+        end
+      end)
+    end
+
+    test "anonymous GET on a private bucket returns 403 AccessDenied" do
+      :ok = Index.ensure_bucket("private-b")
+
+      conn = Plug.Test.conn(:get, "/private-b") |> Kafun.Router.call(Kafun.Router.init([]))
+      assert conn.status == 403
+      assert conn.resp_body =~ "AccessDenied"
+    end
+
+    test "anonymous GET on a public-read bucket succeeds" do
+      :ok = Index.ensure_bucket("public-b")
+      :ok = Index.set_bucket_public_read("public-b", true)
+
+      conn =
+        Plug.Test.conn(:get, "/public-b?list-type=2") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "anonymous PUT on a public-read bucket is still 403 (writes never anonymous)" do
+      :ok = Index.ensure_bucket("public-b")
+      :ok = Index.set_bucket_public_read("public-b", true)
+
+      conn =
+        Plug.Test.conn(:put, "/public-b/k", "x") |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 403
+    end
+
+    test "signed GET with a read grant succeeds" do
+      :ok = Index.ensure_bucket("test-bucket")
+      :ok = Index.create_access_key("READER", "secret", "")
+      :ok = Index.upsert_grant("READER", "test-bucket", :read)
+
+      conn =
+        signed_router_conn(:get, "/test-bucket?list-type=2",
+          access_key: "READER",
+          secret_key: "secret"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "signed PUT object with only a :read grant is 403 forbidden" do
+      :ok = Index.ensure_bucket("test-bucket")
+      :ok = Index.create_access_key("READER", "secret", "")
+      :ok = Index.upsert_grant("READER", "test-bucket", :read)
+
+      conn =
+        signed_router_conn(:put, "/test-bucket/k",
+          access_key: "READER",
+          secret_key: "secret",
+          payload: {:hash, ""}
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 403
+      assert conn.resp_body =~ "AccessDenied"
+    end
+
+    test "signed PUT with a :write grant succeeds" do
+      :ok = Index.ensure_bucket("test-bucket")
+      :ok = Index.create_access_key("WRITER", "secret", "")
+      :ok = Index.upsert_grant("WRITER", "test-bucket", :write)
+
+      conn =
+        signed_router_conn(:put, "/test-bucket/k",
+          access_key: "WRITER",
+          secret_key: "secret",
+          payload: {:hash, ""}
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "CreateBucket without a global admin grant is 403" do
+      :ok = Index.create_access_key("LOCAL_ADMIN", "secret", "")
+      :ok = Index.upsert_grant("LOCAL_ADMIN", "specific", :admin)
+
+      conn =
+        signed_router_conn(:put, "/new-bucket",
+          access_key: "LOCAL_ADMIN",
+          secret_key: "secret"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 403
+    end
+
+    test "CreateBucket with a global admin grant succeeds" do
+      :ok = Index.create_access_key("GLOBAL_ADMIN", "secret", "")
+      :ok = Index.upsert_grant("GLOBAL_ADMIN", "*", :admin)
+
+      conn =
+        signed_router_conn(:put, "/new-bucket",
+          access_key: "GLOBAL_ADMIN",
+          secret_key: "secret"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "ListAllMyBuckets returns only buckets the caller can access" do
+      :ok = Index.ensure_bucket("granted")
+      :ok = Index.ensure_bucket("denied")
+      :ok = Index.create_access_key("LIMITED", "secret", "")
+      :ok = Index.upsert_grant("LIMITED", "granted", :read)
+
+      conn =
+        signed_router_conn(:get, "/", access_key: "LIMITED", secret_key: "secret")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "<Name>granted</Name>"
+      refute conn.resp_body =~ "<Name>denied</Name>"
+    end
+
+    test "env-bootstrapped key with empty secret and global admin works without sig verification" do
+      :ok = Index.ensure_bucket("any")
+      :ok = Index.create_access_key("ENV_KEY", "", "env-bootstrap")
+      :ok = Index.upsert_grant("ENV_KEY", "*", :admin)
+
+      # Sign with a bogus secret — verifier sees :empty_secret and skips check.
+      conn =
+        signed_router_conn(:get, "/any?list-type=2",
+          access_key: "ENV_KEY",
+          secret_key: "anything"
+        )
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 200
+    end
+
+    test "revoked key returns 403 InvalidAccessKeyId" do
+      :ok = Index.ensure_bucket("test-bucket")
+      :ok = Index.create_access_key("DEAD", "secret", "")
+      :ok = Index.upsert_grant("DEAD", "*", :admin)
+      :ok = Index.revoke_access_key("DEAD")
+
+      conn =
+        signed_router_conn(:get, "/test-bucket", access_key: "DEAD", secret_key: "secret")
+        |> Kafun.Router.call(Kafun.Router.init([]))
+
+      assert conn.status == 403
+      assert conn.resp_body =~ "InvalidAccessKeyId"
+    end
   end
 
   describe "Migrate end-to-end via two Bandit instances over loopback" do
@@ -318,6 +855,120 @@ defmodule KafunTest do
         |> IO.iodata_to_binary()
 
       assert xml =~ "/foo&amp;bar"
+    end
+  end
+
+  describe "Index access keys + grants" do
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-acl-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      start_supervised!({Index, db_path: db})
+      on_exit(fn -> File.rm_rf!(tmp) end)
+      :ok
+    end
+
+    test "create / get / list / revoke an access key" do
+      :ok = Index.create_access_key("AKID0", "secret0", "test key")
+      assert {:ok, %{id: "AKID0", secret: "secret0", description: "test key", status: :active}} =
+               Index.get_access_key("AKID0")
+
+      assert [%{id: "AKID0", status: :active}] = Index.list_access_keys()
+
+      :ok = Index.revoke_access_key("AKID0")
+      assert {:ok, %{status: :revoked, revoked_at: ts}} = Index.get_access_key("AKID0")
+      assert is_integer(ts)
+    end
+
+    test "revoke / set_secret / set_description return :not_found on unknown id" do
+      assert :not_found = Index.revoke_access_key("ghost")
+      assert :not_found = Index.set_access_key_secret("ghost", "x")
+      assert :not_found = Index.set_access_key_description("ghost", "x")
+      assert :not_found = Index.get_access_key("ghost")
+    end
+
+    test "create is idempotent — re-creating an existing id is a no-op" do
+      :ok = Index.create_access_key("AKID1", "first", "first version")
+      :ok = Index.create_access_key("AKID1", "second", "shouldn't replace")
+
+      assert {:ok, %{secret: "first", description: "first version"}} =
+               Index.get_access_key("AKID1")
+    end
+
+    test "set_access_key_secret rotates the secret in place" do
+      :ok = Index.create_access_key("AKID2", "old", "")
+      :ok = Index.set_access_key_secret("AKID2", "new")
+      assert {:ok, %{secret: "new"}} = Index.get_access_key("AKID2")
+    end
+
+    test "upsert_grant + list_bucket_grants + list_grants_for_key" do
+      :ok = Index.create_access_key("AKID3", "s", "")
+      :ok = Index.upsert_grant("AKID3", "wallpapers", :write)
+      :ok = Index.upsert_grant("AKID3", "imouto-images", :read)
+
+      assert [%{access_key_id: "AKID3", permission: :write}] =
+               Index.list_bucket_grants("wallpapers")
+
+      assert grants = Index.list_grants_for_key("AKID3")
+      assert Enum.map(grants, & &1.bucket) |> Enum.sort() == ["imouto-images", "wallpapers"]
+    end
+
+    test "upsert overwrites permission when called again on same (key, bucket)" do
+      :ok = Index.create_access_key("AKID4", "s", "")
+      :ok = Index.upsert_grant("AKID4", "b", :read)
+      :ok = Index.upsert_grant("AKID4", "b", :admin)
+
+      assert [%{permission: :admin}] = Index.list_bucket_grants("b")
+    end
+
+    test "delete_grant removes a single (key, bucket) row" do
+      :ok = Index.create_access_key("AKID5", "s", "")
+      :ok = Index.upsert_grant("AKID5", "a", :read)
+      :ok = Index.upsert_grant("AKID5", "b", :read)
+      :ok = Index.delete_grant("AKID5", "a")
+
+      assert [%{bucket: "b"}] = Index.list_grants_for_key("AKID5")
+    end
+
+    test "effective_grant returns the highest tier across specific + global grants" do
+      :ok = Index.create_access_key("AKID6", "s", "")
+      assert :none = Index.effective_grant("AKID6", "any")
+
+      :ok = Index.upsert_grant("AKID6", "specific", :read)
+      assert :read = Index.effective_grant("AKID6", "specific")
+      assert :none = Index.effective_grant("AKID6", "other")
+
+      :ok = Index.upsert_grant("AKID6", "*", :write)
+      # global :write fills in for buckets without a specific grant
+      assert :write = Index.effective_grant("AKID6", "other")
+      # specific :read is dominated by global :write
+      assert :write = Index.effective_grant("AKID6", "specific")
+
+      :ok = Index.upsert_grant("AKID6", "specific", :admin)
+      # specific :admin now beats the global :write
+      assert :admin = Index.effective_grant("AKID6", "specific")
+    end
+
+    test "set_bucket_public_read flips the column; bucket_public_read?/1 reads it" do
+      :ok = Index.ensure_bucket("public-test")
+      refute Index.bucket_public_read?("public-test")
+
+      :ok = Index.set_bucket_public_read("public-test", true)
+      assert Index.bucket_public_read?("public-test")
+
+      :ok = Index.set_bucket_public_read("public-test", false)
+      refute Index.bucket_public_read?("public-test")
+    end
+
+    test "touch_access_key_last_used is async — caller doesn't wait" do
+      :ok = Index.create_access_key("AKID7", "s", "")
+      :ok = Index.touch_access_key_last_used("AKID7")
+
+      # The cast may race; force a synchronous round-trip to flush the mailbox.
+      _ = Index.list_access_keys()
+
+      {:ok, key} = Index.get_access_key("AKID7")
+      assert is_integer(key.last_used_at)
     end
   end
 

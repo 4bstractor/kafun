@@ -34,7 +34,6 @@ defmodule Kafun.Router do
   plug :stamp_request
   plug :fetch_qs
   plug :match
-  plug :authenticate
   plug :dispatch
 
   defp stamp_request(conn, _) do
@@ -56,18 +55,38 @@ defmodule Kafun.Router do
   ## Service-level.
 
   get "/" do
-    send_xml(conn, 200, S3XML.list_all_buckets(Index.list_buckets()))
+    case Auth.authorize_service(conn, action: :list_buckets) do
+      {:ok, caller} ->
+        names = Auth.accessible_buckets(caller) |> MapSet.new()
+
+        visible =
+          Index.list_buckets()
+          |> Enum.filter(fn b -> MapSet.member?(names, b.name) end)
+
+        send_xml(conn, 200, S3XML.list_all_buckets(visible))
+
+      {:error, reason} ->
+        auth_error(conn, reason)
+    end
   end
 
   ## Bucket-level.
 
   put "/:bucket" do
-    if Storage.valid_bucket?(bucket) do
-      :ok = Index.ensure_bucket(bucket)
-      File.mkdir_p!(Path.join(root(), bucket))
-      send_resp(conn, 200, "")
-    else
-      error(conn, 400, "InvalidBucketName", "bucket name is not valid")
+    cond do
+      not Storage.valid_bucket?(bucket) ->
+        error(conn, 400, "InvalidBucketName", "bucket name is not valid")
+
+      true ->
+        case Auth.authorize_service(conn, action: :create_bucket) do
+          {:ok, _} ->
+            :ok = Index.ensure_bucket(bucket)
+            File.mkdir_p!(Path.join(root(), bucket))
+            send_resp(conn, 200, "")
+
+          {:error, reason} ->
+            auth_error(conn, reason)
+        end
     end
   end
 
@@ -81,15 +100,24 @@ defmodule Kafun.Router do
       not Index.bucket_exists?(bucket) ->
         error(conn, 404, "NoSuchBucket", "bucket does not exist")
 
-      Map.has_key?(qs, "uploads") -> list_multipart_uploads(conn, bucket)
-      Map.has_key?(qs, "location") -> send_xml(conn, 200, S3XML.bucket_location())
-      Map.has_key?(qs, "acl") -> send_xml(conn, 200, S3XML.bucket_acl())
-      Map.has_key?(qs, "versioning") -> send_xml(conn, 200, S3XML.bucket_versioning())
-      Map.has_key?(qs, "policy") -> error(conn, 404, "NoSuchBucketPolicy", "bucket has no policy")
-      Map.has_key?(qs, "cors") -> error(conn, 404, "NoSuchCORSConfiguration", "bucket has no CORS configuration")
-      Map.has_key?(qs, "lifecycle") -> error(conn, 404, "NoSuchLifecycleConfiguration", "bucket has no lifecycle configuration")
-      Map.has_key?(qs, "tagging") -> error(conn, 404, "NoSuchTagSet", "bucket has no tag set")
-      true -> list_objects(conn, bucket)
+      true ->
+        case Auth.authorize(conn, action: :read, bucket: bucket) do
+          {:error, reason} ->
+            auth_error(conn, reason)
+
+          :ok ->
+            cond do
+              Map.has_key?(qs, "uploads") -> list_multipart_uploads(conn, bucket)
+              Map.has_key?(qs, "location") -> send_xml(conn, 200, S3XML.bucket_location())
+              Map.has_key?(qs, "acl") -> send_xml(conn, 200, S3XML.bucket_acl())
+              Map.has_key?(qs, "versioning") -> send_xml(conn, 200, S3XML.bucket_versioning())
+              Map.has_key?(qs, "policy") -> error(conn, 404, "NoSuchBucketPolicy", "bucket has no policy")
+              Map.has_key?(qs, "cors") -> error(conn, 404, "NoSuchCORSConfiguration", "bucket has no CORS configuration")
+              Map.has_key?(qs, "lifecycle") -> error(conn, 404, "NoSuchLifecycleConfiguration", "bucket has no lifecycle configuration")
+              Map.has_key?(qs, "tagging") -> error(conn, 404, "NoSuchTagSet", "bucket has no tag set")
+              true -> list_objects(conn, bucket)
+            end
+        end
     end
   end
 
@@ -98,11 +126,14 @@ defmodule Kafun.Router do
       not Storage.valid_bucket?(bucket) ->
         error(conn, 400, "InvalidBucketName", "bucket name is not valid")
 
-      Index.bucket_exists?(bucket) ->
-        send_resp(conn, 200, "")
+      not Index.bucket_exists?(bucket) ->
+        error(conn, 404, "NoSuchBucket", "bucket does not exist")
 
       true ->
-        error(conn, 404, "NoSuchBucket", "bucket does not exist")
+        case Auth.authorize(conn, action: :read, bucket: bucket) do
+          :ok -> send_resp(conn, 200, "")
+          {:error, reason} -> auth_error(conn, reason)
+        end
     end
   end
 
@@ -114,11 +145,14 @@ defmodule Kafun.Router do
       not Index.bucket_exists?(bucket) ->
         error(conn, 404, "NoSuchBucket", "bucket does not exist")
 
-      Map.has_key?(conn.query_params, "delete") ->
-        do_delete_objects(conn, bucket)
+      not Map.has_key?(conn.query_params, "delete") ->
+        error(conn, 400, "InvalidRequest", "POST on a bucket requires ?delete")
 
       true ->
-        error(conn, 400, "InvalidRequest", "POST on a bucket requires ?delete")
+        case Auth.authorize(conn, action: :write, bucket: bucket) do
+          :ok -> do_delete_objects(conn, bucket)
+          {:error, reason} -> auth_error(conn, reason)
+        end
     end
   end
 
@@ -128,16 +162,22 @@ defmodule Kafun.Router do
         error(conn, 400, "InvalidBucketName", "bucket name is not valid")
 
       true ->
-        case Index.delete_bucket(bucket) do
+        case Auth.authorize(conn, action: :admin, bucket: bucket) do
+          {:error, reason} ->
+            auth_error(conn, reason)
+
           :ok ->
-            _ = File.rmdir(Path.join(root(), bucket))
-            send_resp(conn, 204, "")
+            case Index.delete_bucket(bucket) do
+              :ok ->
+                _ = File.rmdir(Path.join(root(), bucket))
+                send_resp(conn, 204, "")
 
-          {:error, :not_found} ->
-            error(conn, 404, "NoSuchBucket", "bucket does not exist")
+              {:error, :not_found} ->
+                error(conn, 404, "NoSuchBucket", "bucket does not exist")
 
-          {:error, :not_empty} ->
-            error(conn, 409, "BucketNotEmpty", "bucket is not empty")
+              {:error, :not_empty} ->
+                error(conn, 409, "BucketNotEmpty", "bucket is not empty")
+            end
         end
     end
   end
@@ -145,51 +185,55 @@ defmodule Kafun.Router do
   ## Object-level.
 
   post "/:bucket/*key_parts" do
-    with_object(conn, bucket, key_parts, &dispatch_post/3)
+    with_object(conn, bucket, key_parts, :write, &dispatch_post/3)
   end
 
   put "/:bucket/*key_parts" do
-    with_object(conn, bucket, key_parts, &dispatch_put/3)
+    with_object(conn, bucket, key_parts, :write, &dispatch_put/3)
   end
 
   get "/:bucket/*key_parts" do
-    with_object(conn, bucket, key_parts, &dispatch_get/3)
+    with_object(conn, bucket, key_parts, :read, &dispatch_get/3)
   end
 
   match "/:bucket/*key_parts", via: :head do
-    with_object(conn, bucket, key_parts, &do_head/3)
+    with_object(conn, bucket, key_parts, :read, &do_head/3)
   end
 
   delete "/:bucket/*key_parts" do
-    with_object(conn, bucket, key_parts, &dispatch_delete/3)
+    with_object(conn, bucket, key_parts, :write, &dispatch_delete/3)
   end
 
   match _ do
     error(conn, 404, "NoSuchKey", "no route")
   end
 
-  ## Pipeline plug.
+  ## Auth error mapping. Each handler calls `Auth.authorize/2` (or
+  ## `Auth.authorize_service/2`) and feeds the `{:error, reason}` here.
 
-  defp authenticate(%Plug.Conn{request_path: "/healthz"} = conn, _), do: conn
+  defp auth_error(conn, :unauthenticated),
+    do: error(conn, 403, "AccessDenied", "request is not authenticated")
 
-  defp authenticate(conn, _) do
-    if Auth.disabled?() do
-      conn
-    else
-      case Auth.access_key(conn) do
-        {:ok, key} ->
-          if Auth.allowed?(key) do
-            conn
-          else
-            error(conn, 403, "InvalidAccessKeyId", "access key not authorized") |> halt()
-          end
+  defp auth_error(conn, :unknown_key),
+    do: error(conn, 403, "InvalidAccessKeyId", "access key not recognised")
 
-        :error ->
-          error(conn, 403, "MissingAuthenticationToken", "no SigV4 credential found")
-          |> halt()
-      end
-    end
-  end
+  defp auth_error(conn, :revoked_key),
+    do: error(conn, 403, "InvalidAccessKeyId", "access key has been revoked")
+
+  defp auth_error(conn, :invalid_signature),
+    do: error(conn, 403, "SignatureDoesNotMatch", "request signature is not valid")
+
+  defp auth_error(conn, :stream_signed_payload),
+    do:
+      error(
+        conn,
+        400,
+        "InvalidRequest",
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD is not supported; use UNSIGNED-PAYLOAD or STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+      )
+
+  defp auth_error(conn, :forbidden),
+    do: error(conn, 403, "AccessDenied", "insufficient permissions for this action")
 
   ## Method dispatchers — branch on multipart query params.
 
@@ -388,6 +432,7 @@ defmodule Kafun.Router do
 
     with {:ok, src_bucket, src_key} <- parse_copy_source(src_header),
          true <- Storage.valid_bucket?(src_bucket) and Storage.valid_key?(src_key),
+         {:auth, :ok} <- {:auth, Auth.authorize(conn, action: :read, bucket: src_bucket)},
          {:ok, src_meta} <- fetch_src_meta(src_bucket, src_key),
          :ok <- eval_copy_preconditions(conn, src_meta),
          {:ok, _size} <- Storage.copy_blob(root(), src_bucket, src_key, dst_bucket, dst_key) do
@@ -414,6 +459,7 @@ defmodule Kafun.Router do
       send_xml(conn, 200, S3XML.copy_object_result(src_meta.etag, now))
     else
       false -> error(conn, 400, "InvalidArgument", "source bucket or key invalid")
+      {:auth, {:error, reason}} -> auth_error(conn, reason)
       {:error, :invalid_copy_source} -> error(conn, 400, "InvalidArgument", "x-amz-copy-source malformed")
       {:error, :no_such_key} -> error(conn, 404, "NoSuchKey", "source object does not exist")
       {:error, :not_found} -> error(conn, 404, "NoSuchKey", "source object missing on disk")
@@ -428,6 +474,7 @@ defmodule Kafun.Router do
          true <- n in 1..10_000,
          {:ok, src_bucket, src_key} <- parse_copy_source(src_header),
          true <- Storage.valid_bucket?(src_bucket) and Storage.valid_key?(src_key),
+         {:auth, :ok} <- {:auth, Auth.authorize(conn, action: :read, bucket: src_bucket)},
          {:ok, _upload} <- fetch_upload(upload_id),
          {:ok, src_meta} <- fetch_src_meta(src_bucket, src_key),
          {:range, range} when range != :invalid <-
@@ -448,6 +495,7 @@ defmodule Kafun.Router do
     else
       :error -> error(conn, 400, "InvalidArgument", "partNumber not parseable")
       false -> error(conn, 400, "InvalidArgument", "partNumber must be 1..10000 or source invalid")
+      {:auth, {:error, reason}} -> auth_error(conn, reason)
       {:error, :invalid_copy_source} -> error(conn, 400, "InvalidArgument", "x-amz-copy-source malformed")
       {:error, :no_such_upload} -> error(conn, 404, "NoSuchUpload", upload_id)
       {:error, :no_such_key} -> error(conn, 404, "NoSuchKey", "source object does not exist")
@@ -779,7 +827,7 @@ defmodule Kafun.Router do
 
   ## Helpers.
 
-  defp with_object(conn, bucket, key_parts, fun) do
+  defp with_object(conn, bucket, key_parts, action, fun) do
     key = Enum.join(key_parts, "/")
 
     cond do
@@ -793,7 +841,10 @@ defmodule Kafun.Router do
         error(conn, 404, "NoSuchBucket", "bucket does not exist")
 
       true ->
-        fun.(conn, bucket, key)
+        case Auth.authorize(conn, action: action, bucket: bucket) do
+          :ok -> fun.(conn, bucket, key)
+          {:error, reason} -> auth_error(conn, reason)
+        end
     end
   end
 

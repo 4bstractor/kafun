@@ -51,7 +51,15 @@ defmodule Kafun.Index do
   buckets index. One scan over `objects` grouped by bucket; fine at homelab
   scale (sqlite handles a few million rows in milliseconds).
   """
-  @spec bucket_stats() :: [%{name: String.t(), object_count: non_neg_integer(), total_bytes: non_neg_integer(), created_at: integer()}]
+  @spec bucket_stats() :: [
+          %{
+            name: String.t(),
+            object_count: non_neg_integer(),
+            total_bytes: non_neg_integer(),
+            created_at: integer(),
+            public_read: boolean()
+          }
+        ]
   def bucket_stats, do: GenServer.call(@name, :bucket_stats)
 
   @spec bucket_exists?(String.t()) :: boolean()
@@ -162,6 +170,93 @@ defmodule Kafun.Index do
   @spec backup_to(Path.t()) :: :ok | {:error, term()}
   def backup_to(target_path), do: GenServer.call(@name, {:backup_to, target_path}, 30_000)
 
+  ## Access keys + grants — ACL surface.
+
+  @type access_key_record :: %{
+          id: String.t(),
+          secret: String.t(),
+          description: String.t(),
+          status: :active | :revoked,
+          created_at: integer(),
+          revoked_at: integer() | nil,
+          last_used_at: integer() | nil
+        }
+
+  @type permission :: :read | :write | :admin
+
+  @doc "Insert a new access key. Idempotent — re-creating an existing id replaces nothing (no-op)."
+  @spec create_access_key(String.t(), String.t(), String.t()) :: :ok
+  def create_access_key(id, secret, description \\ "") do
+    GenServer.call(@name, {:create_access_key, id, secret, description})
+  end
+
+  @spec get_access_key(String.t()) :: {:ok, access_key_record()} | :not_found
+  def get_access_key(id), do: GenServer.call(@name, {:get_access_key, id})
+
+  @doc "Lists every key, both active and revoked. Caller filters."
+  @spec list_access_keys() :: [access_key_record()]
+  def list_access_keys, do: GenServer.call(@name, :list_access_keys)
+
+  @spec revoke_access_key(String.t()) :: :ok | :not_found
+  def revoke_access_key(id), do: GenServer.call(@name, {:revoke_access_key, id})
+
+  @spec set_access_key_secret(String.t(), String.t()) :: :ok | :not_found
+  def set_access_key_secret(id, secret) do
+    GenServer.call(@name, {:set_access_key_secret, id, secret})
+  end
+
+  @spec set_access_key_description(String.t(), String.t()) :: :ok | :not_found
+  def set_access_key_description(id, description) do
+    GenServer.call(@name, {:set_access_key_description, id, description})
+  end
+
+  @doc "Best-effort touch of last_used_at. Cast — no reply, never blocks the request path."
+  @spec touch_access_key_last_used(String.t()) :: :ok
+  def touch_access_key_last_used(id) do
+    GenServer.cast(@name, {:touch_access_key_last_used, id, System.system_time(:second)})
+  end
+
+  @doc "Upsert a per-bucket grant. `bucket` may be the sentinel `\"*\"` for global."
+  @spec upsert_grant(String.t(), String.t(), permission()) :: :ok
+  def upsert_grant(access_key_id, bucket, permission) when permission in [:read, :write, :admin] do
+    GenServer.call(@name, {:upsert_grant, access_key_id, bucket, permission})
+  end
+
+  @spec delete_grant(String.t(), String.t()) :: :ok
+  def delete_grant(access_key_id, bucket) do
+    GenServer.call(@name, {:delete_grant, access_key_id, bucket})
+  end
+
+  @spec list_bucket_grants(String.t()) ::
+          [%{access_key_id: String.t(), permission: permission(), granted_at: integer()}]
+  def list_bucket_grants(bucket), do: GenServer.call(@name, {:list_bucket_grants, bucket})
+
+  @spec list_grants_for_key(String.t()) ::
+          [%{bucket: String.t(), permission: permission(), granted_at: integer()}]
+  def list_grants_for_key(access_key_id) do
+    GenServer.call(@name, {:list_grants_for_key, access_key_id})
+  end
+
+  @doc """
+  The effective permission this `access_key_id` holds on `bucket`. Considers
+  both the specific-bucket grant and any global `*` grant; returns the
+  *highest* tier across both. The sentinel `\"*\"` access_key_id models
+  anonymous access — anonymous-public buckets get a read grant materialised
+  on toggle.
+  """
+  @spec effective_grant(String.t(), String.t()) :: permission() | :none
+  def effective_grant(access_key_id, bucket) do
+    GenServer.call(@name, {:effective_grant, access_key_id, bucket})
+  end
+
+  @spec set_bucket_public_read(String.t(), boolean()) :: :ok
+  def set_bucket_public_read(bucket, public?) do
+    GenServer.call(@name, {:set_bucket_public_read, bucket, public?})
+  end
+
+  @spec bucket_public_read?(String.t()) :: boolean()
+  def bucket_public_read?(bucket), do: GenServer.call(@name, {:bucket_public_read?, bucket})
+
   ## Server
 
   @impl true
@@ -200,8 +295,33 @@ defmodule Kafun.Index do
     :ok =
       Sqlite3.execute(conn, """
       CREATE TABLE IF NOT EXISTS buckets (
-        name       TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL
+        name        TEXT PRIMARY KEY,
+        created_at  INTEGER NOT NULL,
+        public_read INTEGER NOT NULL DEFAULT 0
+      ) WITHOUT ROWID
+      """)
+
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE TABLE IF NOT EXISTS access_keys (
+        id           TEXT PRIMARY KEY,
+        secret       TEXT NOT NULL DEFAULT '',
+        description  TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT 'active',
+        created_at   INTEGER NOT NULL,
+        revoked_at   INTEGER,
+        last_used_at INTEGER
+      ) WITHOUT ROWID
+      """)
+
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE TABLE IF NOT EXISTS bucket_grants (
+        access_key_id TEXT NOT NULL,
+        bucket        TEXT NOT NULL,
+        permission    TEXT NOT NULL,
+        granted_at    INTEGER NOT NULL,
+        PRIMARY KEY (access_key_id, bucket)
       ) WITHOUT ROWID
       """)
 
@@ -234,7 +354,8 @@ defmodule Kafun.Index do
       [
         "ALTER TABLE parts ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE objects ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'",
-        "ALTER TABLE uploads ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'"
+        "ALTER TABLE uploads ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE buckets ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0"
       ],
       fn sql ->
         case Sqlite3.execute(conn, sql) do
@@ -288,12 +409,63 @@ defmodule Kafun.Index do
         SELECT b.name,
                b.created_at,
                COALESCE((SELECT COUNT(*) FROM objects WHERE bucket = b.name), 0),
-               COALESCE((SELECT SUM(size) FROM objects WHERE bucket = b.name), 0)
+               COALESCE((SELECT SUM(size) FROM objects WHERE bucket = b.name), 0),
+               b.public_read
         FROM buckets b ORDER BY b.name
         """),
       bucket_exists: prep(conn, "SELECT 1 FROM buckets WHERE name = ? LIMIT 1"),
       bucket_has_objects: prep(conn, "SELECT 1 FROM objects WHERE bucket = ? LIMIT 1"),
       delete_bucket: prep(conn, "DELETE FROM buckets WHERE name = ?"),
+      bucket_public_read: prep(conn, "SELECT public_read FROM buckets WHERE name = ? LIMIT 1"),
+      set_bucket_public_read: prep(conn, "UPDATE buckets SET public_read = ? WHERE name = ?"),
+      create_access_key:
+        prep(conn, """
+        INSERT OR IGNORE INTO access_keys (id, secret, description, status, created_at)
+        VALUES (?, ?, ?, 'active', ?)
+        """),
+      get_access_key:
+        prep(conn, """
+        SELECT id, secret, description, status, created_at, revoked_at, last_used_at
+        FROM access_keys WHERE id = ?
+        """),
+      list_access_keys:
+        prep(conn, """
+        SELECT id, secret, description, status, created_at, revoked_at, last_used_at
+        FROM access_keys ORDER BY created_at DESC
+        """),
+      revoke_access_key:
+        prep(conn, "UPDATE access_keys SET status = 'revoked', revoked_at = ? WHERE id = ?"),
+      set_access_key_secret:
+        prep(conn, "UPDATE access_keys SET secret = ? WHERE id = ?"),
+      set_access_key_description:
+        prep(conn, "UPDATE access_keys SET description = ? WHERE id = ?"),
+      touch_access_key_last_used:
+        prep(conn, "UPDATE access_keys SET last_used_at = ? WHERE id = ?"),
+      upsert_grant:
+        prep(conn, """
+        INSERT INTO bucket_grants (access_key_id, bucket, permission, granted_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (access_key_id, bucket) DO UPDATE SET
+          permission = excluded.permission,
+          granted_at = excluded.granted_at
+        """),
+      delete_grant:
+        prep(conn, "DELETE FROM bucket_grants WHERE access_key_id = ? AND bucket = ?"),
+      list_bucket_grants:
+        prep(conn, """
+        SELECT access_key_id, permission, granted_at FROM bucket_grants
+        WHERE bucket = ? ORDER BY granted_at
+        """),
+      list_grants_for_key:
+        prep(conn, """
+        SELECT bucket, permission, granted_at FROM bucket_grants
+        WHERE access_key_id = ? ORDER BY bucket
+        """),
+      effective_grant:
+        prep(conn, """
+        SELECT permission FROM bucket_grants
+        WHERE access_key_id = ? AND bucket IN (?, '*')
+        """),
       list_open:
         prep(conn, """
         SELECT key, size, etag, mtime FROM objects
@@ -412,8 +584,14 @@ defmodule Kafun.Index do
     rows = fetch_all(state, :bucket_stats, [])
 
     out =
-      Enum.map(rows, fn [n, ts, count, bytes] ->
-        %{name: n, created_at: ts, object_count: count, total_bytes: bytes || 0}
+      Enum.map(rows, fn [n, ts, count, bytes, public_read] ->
+        %{
+          name: n,
+          created_at: ts,
+          object_count: count,
+          total_bytes: bytes || 0,
+          public_read: public_read == 1
+        }
       end)
 
     {:reply, out, state}
@@ -444,6 +622,108 @@ defmodule Kafun.Index do
       end
 
     {:reply, reply, state}
+  end
+
+  def handle_call({:bucket_public_read?, name}, _from, state) do
+    reply =
+      case fetch_one(state, :bucket_public_read, [name]) do
+        [1] -> true
+        _ -> false
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:set_bucket_public_read, name, public?}, _from, state) do
+    run(state, :set_bucket_public_read, [bool_to_int(public?), name])
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:create_access_key, id, secret, description}, _from, state) do
+    run(state, :create_access_key, [id, secret, description, System.system_time(:second)])
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:get_access_key, id}, _from, state) do
+    case fetch_one(state, :get_access_key, [id]) do
+      nil -> {:reply, :not_found, state}
+      row -> {:reply, {:ok, access_key_row(row)}, state}
+    end
+  end
+
+  def handle_call(:list_access_keys, _from, state) do
+    rows = fetch_all(state, :list_access_keys, [])
+    {:reply, Enum.map(rows, &access_key_row/1), state}
+  end
+
+  def handle_call({:revoke_access_key, id}, _from, state) do
+    if fetch_one(state, :get_access_key, [id]) == nil do
+      {:reply, :not_found, state}
+    else
+      run(state, :revoke_access_key, [System.system_time(:second), id])
+      {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:set_access_key_secret, id, secret}, _from, state) do
+    if fetch_one(state, :get_access_key, [id]) == nil do
+      {:reply, :not_found, state}
+    else
+      run(state, :set_access_key_secret, [secret, id])
+      {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:set_access_key_description, id, desc}, _from, state) do
+    if fetch_one(state, :get_access_key, [id]) == nil do
+      {:reply, :not_found, state}
+    else
+      run(state, :set_access_key_description, [desc, id])
+      {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:upsert_grant, key_id, bucket, permission}, _from, state) do
+    run(state, :upsert_grant, [key_id, bucket, permission_to_string(permission), System.system_time(:second)])
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:delete_grant, key_id, bucket}, _from, state) do
+    run(state, :delete_grant, [key_id, bucket])
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:list_bucket_grants, bucket}, _from, state) do
+    rows = fetch_all(state, :list_bucket_grants, [bucket])
+
+    out =
+      Enum.map(rows, fn [key_id, perm, ts] ->
+        %{access_key_id: key_id, permission: permission_from_string(perm), granted_at: ts}
+      end)
+
+    {:reply, out, state}
+  end
+
+  def handle_call({:list_grants_for_key, key_id}, _from, state) do
+    rows = fetch_all(state, :list_grants_for_key, [key_id])
+
+    out =
+      Enum.map(rows, fn [bucket, perm, ts] ->
+        %{bucket: bucket, permission: permission_from_string(perm), granted_at: ts}
+      end)
+
+    {:reply, out, state}
+  end
+
+  def handle_call({:effective_grant, key_id, bucket}, _from, state) do
+    rows = fetch_all(state, :effective_grant, [key_id, bucket])
+
+    perm =
+      rows
+      |> Enum.map(fn [p] -> permission_from_string(p) end)
+      |> highest_permission()
+
+    {:reply, perm, state}
   end
 
   def handle_call({:list, bucket, opts}, _from, state) do
@@ -611,6 +891,12 @@ defmodule Kafun.Index do
   end
 
   @impl true
+  def handle_cast({:touch_access_key_last_used, id, ts}, state) do
+    run(state, :touch_access_key_last_used, [ts, id])
+    {:noreply, state}
+  end
+
+  @impl true
   def terminate(_reason, %State{conn: conn, stmts: stmts}) do
     Enum.each(stmts, fn {_, s} -> Sqlite3.release(conn, s) end)
     Sqlite3.close(conn)
@@ -675,6 +961,42 @@ defmodule Kafun.Index do
     end
   rescue
     _ -> %{}
+  end
+
+  ## ACL helpers — string ↔ atom and permission ordering
+
+  defp permission_to_string(:read), do: "read"
+  defp permission_to_string(:write), do: "write"
+  defp permission_to_string(:admin), do: "admin"
+
+  defp permission_from_string("read"), do: :read
+  defp permission_from_string("write"), do: :write
+  defp permission_from_string("admin"), do: :admin
+
+  defp permission_rank(:none), do: 0
+  defp permission_rank(:read), do: 1
+  defp permission_rank(:write), do: 2
+  defp permission_rank(:admin), do: 3
+
+  defp highest_permission([]), do: :none
+
+  defp highest_permission(perms) do
+    Enum.max_by(perms, &permission_rank/1, fn -> :none end)
+  end
+
+  defp bool_to_int(true), do: 1
+  defp bool_to_int(false), do: 0
+
+  defp access_key_row([id, secret, desc, status, created_at, revoked_at, last_used_at]) do
+    %{
+      id: id,
+      secret: secret,
+      description: desc,
+      status: String.to_existing_atom(status),
+      created_at: created_at,
+      revoked_at: revoked_at,
+      last_used_at: last_used_at
+    }
   end
 
   defp ensure_bucket_inline(state, name) do

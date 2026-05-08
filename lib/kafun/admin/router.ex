@@ -22,5 +22,6 @@ defmodule Kafun.Admin.Router do
     live "/buckets/:bucket/*key_parts", ObjectLive, :show
     live "/uploads", UploadsLive, :index
     live "/status", StatusLive, :index
+    live "/keys", KeysLive, :index
   end
 end

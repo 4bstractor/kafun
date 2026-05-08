@@ -35,6 +35,7 @@ defmodule Kafun.Admin.BucketLive do
           progress: &handle_progress/3
         )
         |> load_page("")
+        |> load_perms()
 
       {:ok, socket}
     else
@@ -73,6 +74,47 @@ defmodule Kafun.Admin.BucketLive do
 
   def handle_event("cancel-upload", %{"ref" => ref}, socket) do
     {:noreply, cancel_upload(socket, :files, ref)}
+  end
+
+  ## Permissions panel
+
+  def handle_event("toggle_public_read", _params, socket) do
+    new_state = not socket.assigns.public_read
+    :ok = Index.set_bucket_public_read(socket.assigns.bucket, new_state)
+
+    notice =
+      if new_state,
+        do: {:info, "anonymous read access enabled"},
+        else: {:info, "anonymous read access disabled"}
+
+    {:noreply, socket |> load_perms() |> assign(notice: notice)}
+  end
+
+  def handle_event("add_grant", %{"access_key_id" => key_id, "permission" => perm}, socket) do
+    cond do
+      key_id == "" ->
+        {:noreply, assign(socket, notice: {:error, "pick an access key first"})}
+
+      perm not in ~w(read write admin) ->
+        {:noreply, assign(socket, notice: {:error, "invalid permission"})}
+
+      true ->
+        :ok = Index.upsert_grant(key_id, socket.assigns.bucket, String.to_atom(perm))
+
+        {:noreply,
+         socket
+         |> load_perms()
+         |> assign(notice: {:info, "granted #{perm} on #{socket.assigns.bucket} to #{mask_id(key_id)}"})}
+    end
+  end
+
+  def handle_event("delete_grant", %{"access_key_id" => key_id}, socket) do
+    :ok = Index.delete_grant(key_id, socket.assigns.bucket)
+
+    {:noreply,
+     socket
+     |> load_perms()
+     |> assign(notice: {:info, "revoked grant for #{mask_id(key_id)}"})}
   end
 
   ## Phoenix LiveView upload progress callback. Fires on every progress
@@ -134,6 +176,23 @@ defmodule Kafun.Admin.BucketLive do
     |> String.trim_leading("/")
     |> then(fn s -> if s == "" or String.ends_with?(s, "/"), do: s, else: s <> "/" end)
   end
+
+  defp load_perms(socket) do
+    bucket = socket.assigns.bucket
+
+    assign(socket,
+      public_read: Index.bucket_public_read?(bucket),
+      grants: Index.list_bucket_grants(bucket),
+      available_keys:
+        Index.list_access_keys() |> Enum.filter(&(&1.status == :active))
+    )
+  end
+
+  defp mask_id(id) when byte_size(id) >= 8 do
+    String.slice(id, 0..3) <> "…" <> String.slice(id, -4..-1//1)
+  end
+
+  defp mask_id(id), do: id
 
   defp load_page(socket, prefix) do
     {entries, common_prefixes, truncated?, _next} =
@@ -284,6 +343,82 @@ defmodule Kafun.Admin.BucketLive do
         </p>
       <% end %>
     <% end %>
+
+    <h2>Permissions</h2>
+
+    <div class="perms-block">
+      <div class="perms-public">
+        <label class="perms-public-label">
+          <input type="checkbox"
+                 phx-click="toggle_public_read"
+                 checked={@public_read} />
+          <strong>Public read access</strong> —
+          allows anonymous (unauthenticated) GET / HEAD / list on this bucket.
+          Writes always require an authenticated key with a grant.
+        </label>
+      </div>
+
+      <h3>Grants</h3>
+      <%= if @grants == [] do %>
+        <div class="empty" style="padding: 1rem;">No per-key grants on this bucket.</div>
+      <% else %>
+        <table>
+          <thead>
+            <tr>
+              <th>Access key</th>
+              <th>Permission</th>
+              <th>Granted</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <%= for g <- @grants do %>
+              <tr>
+                <td><code>{mask_id(g.access_key_id)}</code> <span class="key-full">({g.access_key_id})</span></td>
+                <td><span class="pill">{g.permission}</span></td>
+                <td>{format_date(g.granted_at)}</td>
+                <td>
+                  <button class="btn btn-danger" phx-click="delete_grant"
+                          phx-value-access_key_id={g.access_key_id}
+                          data-confirm={"Remove the #{g.permission} grant from #{mask_id(g.access_key_id)} on #{@bucket}?"}>
+                    Remove
+                  </button>
+                </td>
+              </tr>
+            <% end %>
+          </tbody>
+        </table>
+      <% end %>
+
+      <h3>Add grant</h3>
+      <%= if @available_keys == [] do %>
+        <p style="color: #8b949e;">
+          No active access keys to grant. Generate one on the
+          <.link navigate={~p"/keys"}>Keys page</.link> first.
+        </p>
+      <% else %>
+        <form phx-submit="add_grant" class="row" style="margin-bottom: 1rem; gap: 0.5rem;">
+          <select name="access_key_id" style="max-width: 360px;">
+            <option value="">— select an access key —</option>
+            <%= for k <- @available_keys do %>
+              <option value={k.id}>
+                {mask_id(k.id)}{if k.description != "", do: " · " <> k.description, else: ""}
+              </option>
+            <% end %>
+          </select>
+          <select name="permission">
+            <option value="read">read</option>
+            <option value="write">write</option>
+            <option value="admin">admin</option>
+          </select>
+          <button type="submit" class="btn btn-primary">Grant</button>
+        </form>
+        <p style="color: #8b949e; font-size: 0.85rem;">
+          Tip: a global grant on bucket <code>*</code> applies to every bucket and
+          is best edited via <code>kafun rpc</code> for now (Index.upsert_grant/3).
+        </p>
+      <% end %>
+    </div>
     """
   end
 
