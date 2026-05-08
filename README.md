@@ -37,6 +37,15 @@ You probably don't want kafun if:
 
 ## Quickstart
 
+Generate a session-signing secret once and put it in `.env` next to your
+compose file:
+
+```sh
+echo "KAFUN_ADMIN_SECRET=$(openssl rand -hex 32)" >> .env
+echo "KAFUN_ADMIN_PASSWORD=change-me"             >> .env
+echo "KAFUN_KEYS=AKIAEXAMPLEKEY"                  >> .env
+```
+
 ```yaml
 # docker-compose.yml
 services:
@@ -50,25 +59,26 @@ services:
       - /your/big/pool:/data
     environment:
       KAFUN_ROOT: /data
-      KAFUN_KEYS: AKIAEXAMPLEKEY
-      KAFUN_ADMIN_PASSWORD: change-me
-      KAFUN_ADMIN_SECRET: $(openssl rand -hex 32)
+      KAFUN_KEYS: ${KAFUN_KEYS}
+      KAFUN_ADMIN_PASSWORD: ${KAFUN_ADMIN_PASSWORD}
+      KAFUN_ADMIN_SECRET: ${KAFUN_ADMIN_SECRET}
 ```
 
 ```sh
 docker compose up -d
 ```
 
-Drop a file via curl:
+Sanity check it's alive:
 
 ```sh
-curl -X PUT --data-binary @big.tar http://localhost:8333/mybucket/big.tar
-curl 'http://localhost:8333/mybucket?list-type=2'
+curl http://localhost:8333/healthz
 ```
 
-Or via boto3 / aws-cli pointed at `http://localhost:8333`. Real
-production deployment notes (NPM upstream, env hardening, day-2 ops)
-live in [DEPLOY.md](./DEPLOY.md).
+Then point boto3 / aws-cli at `http://localhost:8333` with your access
+key from `KAFUN_KEYS` (any secret works for bootstrap keys; rotate in
+the admin UI to opt into real SigV4 verification). Real production
+deployment notes — NPM upstream, env hardening, day-2 ops — live in
+[DEPLOY.md](./DEPLOY.md).
 
 ## Admin UI
 
