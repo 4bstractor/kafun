@@ -16,16 +16,17 @@ Kafun is an S3-compatible blob service for the homelab. **Elixir / OTP 27 / Band
 | `lib/kafun/index.ex`         | Single-conn SQLite GenServer with prepared statements. Tables: `objects`, `buckets`, `uploads`, `parts`. Listing scanner with prefix + delimiter + paginated continuation lives here. |
 | `lib/kafun/multipart.ex`     | Initiate / upload-part / complete / abort orchestration. Computes the `md5-of-md5s-N` ETag. |
 | `lib/kafun/gc.ex`            | Tick-based janitor — three passes (abandoned uploads, orphan part dirs, orphan blobs / leftover tmps). Caches its last-run summary for the admin Status page. Emits `[:kafun, :gc, :run]`. |
-| `lib/kafun/auth.ex`          | SigV4 access-key extraction (header + querystring presigned URLs). Signature is **not** verified. |
+| `lib/kafun/auth.ex`          | The central inbound-auth gate. `authorize/2` (per-bucket, action-tier) and `authorize_service/2` (ListAllMyBuckets, CreateBucket). Real SigV4 verification + grant lookup + anonymous public-read fallthrough. Legacy `access_key/1`/`allowed?/1`/`disabled?/0` still present (orphaned, slated for removal). |
+| `lib/kafun/auth/sigv4.ex`    | AWS SigV4. `sign/4` (used by the migrator) and `verify/2` (used by the inbound gate). Header form fully verified; querystring (presigned URLs) returns `:unverified` for now. |
 | `lib/kafun/s3_xml.ex`        | iolist XML builders for every S3 response shape we emit + Saxy parser for the CompleteMultipartUpload and Multi-Object Delete bodies. |
-| `lib/kafun/admin/`           | Phoenix admin UI. `Endpoint`/`Router`/`Layouts`/`Auth` plus four LiveViews: `BucketsLive` (index + create/delete), `BucketLive` (paginated browser, prefix nav, delete-key), `ObjectLive` (preview + meta view/edit, rename, delete), `UploadsLive` (in-flight multiparts + abort), `StatusLive` (GC + telemetry counters). Bound to `KAFUN_ADMIN_PORT` (default 8334). |
+| `lib/kafun/admin/`           | Phoenix admin UI. `Endpoint`/`Router`/`Layouts`/`Auth` plus six LiveViews: `BucketsLive` (index with public-read badges + create/delete), `BucketLive` (paginated browser, prefix nav, drag-and-drop upload, per-row delete, embedded permissions panel), `ObjectLive` (preview + meta view/edit, rename, delete), `UploadsLive` (in-flight multiparts + abort), `StatusLive` (GC + telemetry counters), `KeysLive` (access-key generate/revoke/edit/rotate). Bound to `KAFUN_ADMIN_PORT` (default 8334). |
 | `lib/kafun/backup.ex`        | `Kafun.Backup.run/0` — wraps `Index.backup_to/1` with a default `/var/backups/kafun/kafun-<ts>.db` path. Cron-friendly via the release's `rpc` command. |
-| `lib/kafun/migrate.ex`       | Pull migrator. Speaks S3 (Req + a hand-rolled `Migrate.SigV4` signer) against any source endpoint, idempotently copies into the local kafun. `mix kafun.migrate` is the CLI entry point. |
-| `lib/kafun/migrate/sigv4.ex` | Minimal AWS SigV4 signer — both `:hash` (precomputed-body) and `:unsigned` (`UNSIGNED-PAYLOAD`) modes. Verified deterministic in tests. |
+| `lib/kafun/migrate.ex`       | Pull migrator. Speaks S3 (Req + `Kafun.Auth.SigV4`) against any source endpoint, idempotently copies into the local kafun. `mix kafun.migrate` is the CLI entry point. |
 | `lib/mix/tasks/kafun.migrate.ex` | `mix kafun.migrate --src ... --bucket ...` — ergonomic CLI wrapper around `Kafun.Migrate.run/4`. |
-| `rel/`                       | Deploy artifacts: `sv/kafun/run` + `sv/kafun/log/run` runit service tree, `kafun.env.example` env template. Used by `DEPLOY.md`. (Sibling `rel/openrc/` and `rel/systemd/` drop in alongside if/when kafun ships beyond the homelab.) |
-| `config/runtime.exs`         | Env-var ingest. Hardened: prod requires a stable `KAFUN_ADMIN_SECRET`; dev/test fall back to a per-boot value. |
-| `DEPLOY.md`                  | Production deployment runbook — release build, systemd install, NPM upstream, backup cron, rollback. |
+| `rel/`                       | Deploy artifacts: `kafun.env.example` env template (Docker-first; bind-mounts `/sanzu/objects` into `/data`). `sv/kafun/run` + `sv/kafun/log/run` runit tree kept as an "Alternative: bare metal" path documented in `DEPLOY.md`. |
+| `Dockerfile` + `.dockerignore` | Multi-stage Alpine build: `elixir:1.18-otp-27-alpine` builder forces `ELIXIR_MAKE_FORCE_BUILD=true` for the exqlite NIF; `alpine:3.22` runtime carries just the C runtime libs the BEAM needs. **Pin the runtime tag to whatever Alpine the builder is on** — OpenSSL ABI drift is the bug we hit. |
+| `config/runtime.exs`         | Env-var ingest. Hardened: prod requires a stable `KAFUN_ADMIN_SECRET`; dev/test fall back to a per-boot value. ACL-related runtime knobs are conditional on env-var presence so `config/test.exs` can override safely. |
+| `DEPLOY.md`                  | Production deployment runbook — Docker compose first, NPM upstream, backup cron, rollback, runit/openrc alternative paths. |
 
 ## Run
 
@@ -46,14 +47,19 @@ For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix rele
 | `KAFUN_ROOT`                  | `${tmp}/kafun` in dev  | Required in prod. Blob root + default DB location. |
 | `KAFUN_DB`                    | `<root>/index.db`      | SQLite metadata file. |
 | `KAFUN_HOST` / `KAFUN_PORT`   | `0.0.0.0` / `8333`     | |
-| `KAFUN_KEYS`                  | *(empty)*              | Comma-separated allowed access keys. Empty = auth off. |
+| `KAFUN_KEYS`                  | *(empty)*              | Comma-separated bootstrap access keys. On first boot, each entry lands in `access_keys` with empty secret + global `*` admin grant. Empty-secret keys skip SigV4 verification (legacy unverified mode), so existing deployments survive the upgrade. Operators can rotate to a real secret via the admin UI to opt in to verification. |
+| `KAFUN_AUTH_DISABLED`         | `false`                | Operator escape hatch. `true` short-circuits `Auth.authorize/2` to `:ok`. `config/test.exs` sets this for unsigned-conn tests; flip in prod for recovery scenarios (locked out of admin, rotated cookie, etc.). |
+| `KAFUN_BOOTSTRAP_BUCKETS`     | *(empty)*              | Comma-separated bucket names. On boot, each gets `Index.ensure_bucket/1` + `mkdir_p`. Idempotent. |
 | `KAFUN_LOG_LEVEL`             | `info`                 | |
 | `KAFUN_GC_INTERVAL_SEC`       | `3600`                 | `0` disables periodic sweeps. |
 | `KAFUN_GC_ABANDON_AFTER_SEC`  | `86400`                | Multipart uploads older than this get aborted. |
 | `KAFUN_GC_BLOB_GRACE_SEC`     | `3600`                 | Orphan blobs / `.tmp.*` older than this get GC'd. |
 | `KAFUN_ADMIN_HOST` / `KAFUN_ADMIN_PORT` | `0.0.0.0` / `8334` | Phoenix admin UI bind. |
 | `KAFUN_ADMIN_USER` / `KAFUN_ADMIN_PASSWORD` | `admin` / *(empty)* | Basic-auth gate on the admin UI. Empty password leaves the UI open (trusted-network model). |
-| `KAFUN_ADMIN_SECRET`          | *(generated per boot)* | 64+ byte session signing key. Set to keep sessions across restarts. |
+| `KAFUN_ADMIN_SECRET`          | *(generated per boot)* | 64+ byte session signing key. Set to keep sessions across restarts. **Required in prod.** |
+| `KAFUN_ADMIN_ALLOWED_ORIGINS` | *(empty = no check)*   | Comma-separated CORS origins for the LiveView websocket. Empty disables origin checking — appropriate for trusted LAN behind NPM. Set explicitly to lock down (e.g. `https://kafun.harvelab.com,http://yomi:8334`). |
+| `KAFUN_PUBLIC_S3_URL`         | *(empty = falls back to KAFUN_HOST:KAFUN_PORT)* | Externally reachable URL of the S3 surface. The admin's image-preview `<img src=…>` uses this base so the browser can fetch images from a different machine than the admin UI. |
+| `KAFUN_ADMIN_MAX_UPLOAD_MB`   | `256`                  | Per-file cap for the admin UI drag-and-drop upload. Browser-side rejects files larger than this. |
 
 ## Architecture notes
 
@@ -77,7 +83,7 @@ For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix rele
 
 **Request id.** `:stamp_request` plug is the second plug in the pipeline (right after `Plug.Logger`). Each request gets a `:crypto.strong_rand_bytes(8)` upper-hex id assigned to `conn.assigns[:request_id]` and emitted as `x-amz-request-id` on every response. The same id is carried into `<RequestId>` and `<HostId>` of error XML bodies (we don't differentiate the two; real S3 has two distinct values for AWS-internal tracing, irrelevant here). The `error/4` helper detects `conn.method == "HEAD"` and emits empty body + `x-amz-error-code: <Code>` header instead of the XML body — HEAD has no body to carry the code, so the header is the only signal.
 
-**Index concurrency.** One GenServer owns the SQLite handle and serializes both reads and writes. WAL is on, but we don't exploit it — every call queues. For homelab volumes this is fine; if it becomes a bottleneck, the upgrade path is a `NimblePool` of read connections (writes still through the GenServer to keep `INSERT OR REPLACE` race-free). Two indexes were added beyond the implicit PKs: `uploads(bucket, key, upload_id)` for ListMultipartUploads and `uploads(initiated_at)` for the GC abandoned-upload query. Three idempotent `ALTER TABLE` migrations run in `Index.init/1` for legacy DBs: `parts.mtime`, `objects.meta`, `uploads.meta`.
+**Index concurrency.** One GenServer owns the SQLite handle and serializes both reads and writes. WAL is on, but we don't exploit it — every call queues. For homelab volumes this is fine; if it becomes a bottleneck, the upgrade path is a `NimblePool` of read connections (writes still through the GenServer to keep `INSERT OR REPLACE` race-free). Two indexes were added beyond the implicit PKs: `uploads(bucket, key, upload_id)` for ListMultipartUploads and `uploads(initiated_at)` for the GC abandoned-upload query. Idempotent `ALTER TABLE` migrations run in `Index.init/1` for legacy DBs: `parts.mtime`, `objects.meta`, `uploads.meta`, `buckets.public_read`. The ACL tables (`access_keys`, `bucket_grants`) are `CREATE TABLE IF NOT EXISTS` so they materialize on first boot without a separate migration step.
 
 **User metadata.** `x-amz-meta-*` headers on PUT, CopyObject, and InitiateMultipartUpload are collected into a `%{name => value}` map by `Router.collect_user_meta/1`, JSON-encoded via OTP 27's built-in `:json` module, and stored in `objects.meta` (or `uploads.meta` until Complete promotes it). On GET/HEAD, `Router.put_user_meta/2` walks the decoded map and emits each entry as `x-amz-meta-<name>: <value>`. CopyObject in default COPY mode carries source metadata to the destination (the only directive we honour today; REPLACE is a Tier-2 follow-up). Multipart uploads stash meta at Initiate, read it from the `uploads` row at Complete, and pass it to `Index.put`.
 
@@ -90,7 +96,32 @@ For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix rele
 
 `KAFUN_GC_INTERVAL_SEC=0` disables periodic sweeps; `Kafun.GC.run_now/0` works regardless. Counts surface via `[:kafun, :gc, :run]` measurements.
 
-**Auth.** `Kafun.Auth.access_key/1` extracts the access key from either the `Authorization: AWS4-HMAC-SHA256 Credential=…/…` header or the `X-Amz-Credential=` querystring (presigned URLs). Signature is **not** verified — same trusted-network model as the Python original. Empty `KAFUN_KEYS` disables auth entirely. **Do not add signature verification without explicit ask.**
+**Access keys, grants, and the gate.** `Kafun.Auth.authorize/2` is the central inbound check. Every gated route (object-level via `with_object/5`, bucket-level inline) calls it with `action: :read | :write | :admin` and the bucket name. Flow:
+
+1. Extract SigV4 credentials from the `Authorization` header (or `X-Amz-Credential` querystring).
+2. Look up `access_keys.secret` by id. Missing → `:unknown_key`. Status revoked → `:revoked_key`. Empty secret (legacy env-bootstrap) → skip signature verification.
+3. Verify the signature via `Kafun.Auth.SigV4.verify/2`. Mismatch → `:invalid_signature`.
+4. Look up `Index.effective_grant(key_id, bucket)` — returns the highest tier across the specific-bucket grant and the `*` global grant.
+5. Compare against the action's required tier (3-tier model: read ⊂ write ⊂ admin). Insufficient → `:forbidden`.
+
+**Anonymous public-read.** When step 1 fails (no credentials at all) AND the action is `:read` AND the bucket has `public_read = true` (column on `buckets`), the request is allowed. Writes are never anonymous.
+
+**Schema.** Two tables added in the access-control-lists branch:
+
+- `access_keys (id PK, secret, description, status, created_at, revoked_at, last_used_at)` — soft-delete via `status = 'revoked'`. `last_used_at` updated via cast from the gate so it doesn't block the request path.
+- `bucket_grants (access_key_id, bucket, permission, granted_at, PRIMARY KEY (access_key_id, bucket))` — `bucket = '*'` is the sentinel for global grants. The same `*` is invalid as a real bucket name (regex rejects it), so there's no ambiguity. `permission` is one of `'read' | 'write' | 'admin'`.
+
+`buckets.public_read` is a single-column boolean — the canonical public-read knob. The original spec considered `bucket_grants('*', bucket, 'read')` as the materialized form, but in practice nothing uses that form and the gate just checks the boolean. Simpler.
+
+**KAFUN_KEYS bootstrap (back-compat).** On `Kafun.Application.start/2`, after Index is up, every `KAFUN_KEYS` env entry is migrated into `access_keys` with empty secret + global admin grant. Idempotent — re-creating an existing id is a no-op. Empty-secret keys keep working (`SigV4.verify/2` returns `{:ok, :unverified, key_id}` for those), so existing deployments survive the access-control-lists deploy without any client-side change. Operators rotate via the admin UI's "Rotate secret" button to opt in to real signature verification.
+
+**Streaming-signed payloads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`)** are deliberately rejected with 400 for verified keys — verifying them requires per-chunk signature checks during body read, which would complicate the streaming PUT path. Modern boto3 defaults to `STREAMING-UNSIGNED-PAYLOAD-TRAILER` (which we accept) and aws-cli accepts a config flip. Reject is ~30 LOC; full implementation would be ~150.
+
+**Path traversal protection.** Same as before: `Storage.valid_key?/1` rejects empty / >1024-byte keys, control bytes, `/`-prefixed keys, and any key whose `Path.split/1` contains `.` or `..`. The validator runs in `with_object/5` alongside the bucket-existence check, so every object-level handler is gated. Same validator gates each key inside `DeleteObjects` so a batch delete can't smuggle an `../escape`.
+
+**Auth-disabled escape hatch.** `KAFUN_AUTH_DISABLED=true` short-circuits `Auth.authorize/2` and `Auth.authorize_service/2` to `:ok`. `config/test.exs` sets this true so existing unsigned-conn tests keep working without bootstrapping a key per test. In prod it's an operator recovery valve. The `auth_disabled?` env var is only read at runtime.exs when present, so the test config setting wins by default.
+
+**Origin checking on the admin LiveView socket.** Phoenix's default `check_origin` compares `Origin:` against `url: [host: "localhost"]` from compile-time config. Behind NPM with a custom hostname this rejects the upgrade and forms silently fail. `KAFUN_ADMIN_ALLOWED_ORIGINS` is the env-driven allow-list; empty disables origin checking entirely (trusted-LAN default).
 
 **Path traversal protection.** `Storage.valid_key?/1` rejects empty / >1024-byte keys, control bytes (`\0\n\r`), keys starting with `/`, and any key whose `Path.split/1` contains a `.` or `..` segment. This matters because the on-disk layout uses the raw key as the leaf filename — without validation, a key like `"../../../../tmp/pwned"` would write to `/tmp/pwned` after traversing out of `<root>/<bucket>/<aa>/<bb>/`. The validator runs in the router's `with_object/4` wrapper alongside the bucket-existence check, so every object-level handler is gated. Same validator also gates each key inside `DeleteObjects` so a batch delete can't smuggle an `../escape`.
 
@@ -98,11 +129,22 @@ For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix rele
 
 **Test isolation.** `config/test.exs` sets `start_children?: false` so `Kafun.Application.start/2` doesn't bring up the shared Index/Bandit/GC/Admin endpoint. Tests `start_supervised!` their own Index pointing at a per-test tmp DB and start GC with `interval_ms: 0` to disable the tick. Multipart tests `Application.put_env(:kafun, :root, tmp)` to redirect the storage root. The admin endpoint's `server: …` config also keys off `start_children?`, so the test env doesn't need PubSub or a free port. If you introduce another long-lived process, gate it on the same flag.
 
-**Admin UI.** A Phoenix endpoint on a separate port (`KAFUN_ADMIN_PORT`, default 8334) serves the operator dashboard. Five LiveViews: `BucketsLive` (list with object-count + total-size aggregations from `Index.bucket_stats/0`, plus inline create/delete), `BucketLive` (paginated browser using the existing delimiter-aware listing, with breadcrumbs and per-row delete), `ObjectLive` (inline image preview, metadata view, edit-content-type-and-meta form, rename, delete), `UploadsLive` (cross-bucket in-flight multiparts via `Index.list_all_uploads/0`, with abort), `StatusLive` (GC `Kafun.GC.status/0` + telemetry counters attached per-LV-process and detached on terminate). Image preview uses the S3 surface URL with `?X-Amz-Credential=<KEY>/...` injected so the `<img>` tag works without an Authorization header — the auth layer already accepts presigned-style querystring credentials. Edit-metadata writes directly via `Index.put/7`, bypassing HTTP since same-key meta-only update is just an index row update; rename is `Storage.copy_blob` + `Index.put` + `Storage.delete` + `Index.delete`. Auth is HTTP Basic via `KAFUN_ADMIN_PASSWORD` (single shared credential — no user/identity model in v1, deliberately).
+**Admin UI.** A Phoenix endpoint on a separate port (`KAFUN_ADMIN_PORT`, default 8334) serves the operator dashboard. Six LiveViews:
+
+- `BucketsLive` — list with object-count + total-size aggregations from `Index.bucket_stats/0`, public-read badges, inline create/delete.
+- `BucketLive` — paginated browser using the existing delimiter-aware listing, with breadcrumbs, per-row delete, drag-and-drop upload, and an embedded **Permissions panel** (public-read toggle + per-key grants table + add-grant form pulling from `KeysLive`'s active-keys list).
+- `ObjectLive` — inline image preview, metadata view, edit-content-type-and-meta form, rename, delete. Image preview uses the S3 surface URL with `?X-Amz-Credential=<KEY>/...` injected so the `<img>` tag works without an `Authorization` header — `KAFUN_PUBLIC_S3_URL` is the env-driven base.
+- `UploadsLive` — cross-bucket in-flight multiparts via `Index.list_all_uploads/0`, with abort.
+- `StatusLive` — GC `Kafun.GC.status/0` + telemetry counters attached per-LV-process and detached on terminate.
+- `KeysLive` — `/keys` page. Generate (id+secret shown once in a green panel with "save now" warning), revoke (soft delete), edit description inline, rotate secret. Generated keys land with no grants — operator attaches per-bucket grants via `BucketLive`'s permissions panel.
+
+Edit-metadata writes directly via `Index.put/7`, bypassing HTTP since same-key meta-only update is just an index row update. Rename is `Storage.copy_blob` + `Index.put` + `Storage.delete` + `Index.delete`. Drag-and-drop upload uses Phoenix LV's `allow_upload` primitives + a `Storage.import_file/4` helper that does the same temp+rename + inline-MD5 dance as a wire PUT.
+
+**Admin UI auth model.** HTTP Basic via `KAFUN_ADMIN_PASSWORD` (single shared credential — no user/identity model in v1, deliberately). Migrating the admin UI itself to authenticate via access keys (with a per-key `admin_ui_access` flag) is parked in the pre-publish polish branch. The S3 surface and the admin UI are separate auth concerns by design.
 
 ## What's left for S3 parity
 
-Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (delimiter / pagination / encoding-type / fetch-owner), `?location|acl|versioning|policy|cors|lifecycle|tagging` stubs, PutObject (with `If-Match`/`If-None-Match`), GetObject (Range, all four conditional headers), HeadObject, DeleteObject, multipart Initiate/UploadPart/Complete/Abort/ListMultipartUploads/ListParts (Initiate carries user metadata through to Complete), CopyObject (with `x-amz-copy-source-if-*`), UploadPartCopy, DeleteObjects (multi-delete), aws-chunked unwrap, user metadata round-trip (`x-amz-meta-*`), NoSuchBucket gating, x-amz-request-id + error RequestId/HostId, x-amz-error-code on HEAD 404. End-to-end verified against real boto3 (990-image migration) and via curl wire tests.
+Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (delimiter / pagination / encoding-type / fetch-owner), `?location|acl|versioning|policy|cors|lifecycle|tagging` stubs, PutObject (with `If-Match`/`If-None-Match`), GetObject (Range, all four conditional headers), HeadObject, DeleteObject, multipart Initiate/UploadPart/Complete/Abort/ListMultipartUploads/ListParts (Initiate carries user metadata through to Complete), CopyObject (with `x-amz-copy-source-if-*`), UploadPartCopy, DeleteObjects (multi-delete), aws-chunked unwrap, user metadata round-trip (`x-amz-meta-*`), NoSuchBucket gating, x-amz-request-id + error RequestId/HostId, x-amz-error-code on HEAD 404, **mutable access keys + per-bucket grants + 3-tier permission model + real SigV4 signature verification + anonymous public-read buckets** (the access-control-lists branch). End-to-end verified against real boto3 (990-image migration) and via curl wire tests.
 
 ### Tier 2 — nice-to-haves with realistic clients
 
@@ -116,8 +158,9 @@ Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (d
 
 ### Tier 3 — explicitly out of scope unless asked
 
-- **Versioning, ACLs, bucket policies, IAM, server-side encryption (SSE-S3/KMS/C), object lock, replication, lifecycle rules, inventory, intelligent-tiering, CORS, website hosting.** Deferred — homelab trusted-network model doesn't need them. If implemented later, most are stub responses; only versioning would touch the index schema.
-- **SigV4 signature verification.** Same trusted-network policy. **Do not add without explicit ask.**
+- **Versioning, IAM, server-side encryption (SSE-S3/KMS/C), object lock, replication, lifecycle rules, inventory, intelligent-tiering, CORS, website hosting.** Deferred — homelab use doesn't need them. If implemented later, most are stub responses; only versioning would touch the index schema.
+- **Bucket policies (the JSON-document kind).** The simple grant model (read/write/admin per (key, bucket)) is the contract. Policy documents would be a parallel model.
+- **Encryption at rest for `access_keys.secret`.** Plain text in SQLite is fine for homelab (file-perms-protected on a ZFS dataset). Parked in the pre-publish polish branch — needs a key-derivation strategy and re-encryption tooling for rotation.
 
 ### Other known unknowns
 
@@ -129,10 +172,21 @@ Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (d
 
 ## Roadmap
 
-Done: see "What's left for S3 parity" above (Tier 1 shipped) and `lib/kafun/admin/` for the LiveView dashboard. Open buckets with deferred work:
+Mostly chasing public release at this point. The S3 surface and the admin UI cover all daily homelab flows. Open work, grouped:
 
-- **CopyObject `metadata-directive=REPLACE` ✓ shipped** alongside the admin's edit-metadata flow (the UI takes a shortcut and updates the index directly, but the wire path supports REPLACE too).
-- **Tier-2 wire polish.** `x-amz-bucket-region` on HeadBucket success, multi-range GET, list-buckets pagination, object tagging stubs. None block real flows; revisit if a client complains.
-- **Pagination on the admin BucketLive.** Currently shows the first 100 entries per prefix and notes truncation. Wire `continuation` through query params when a real bucket has >100 keys at one prefix.
-- **Bulk select in admin BucketLive.** No checkbox-select-and-delete-many today; users get one delete at a time. Acceptable for v1.
-- **Mutable access keys / per-key permissions / multi-user.** Out of scope for v1 by user direction. Would need an `access_keys` table and rebuild of `Auth`. The Tier-3 list calls these out.
+**Public release (Phase 1):** license file (Apache 2.0 leaning), README rewrite with screenshots + positioning vs MinIO/SeaweedFS/Garage, published `ghcr.io/4bstractor/kafun:0.1.0` image via GitHub Actions on tag, CI running `mix test` on push, CHANGELOG.md + commit to semver, comparison doc, backup story for non-ZFS users. Card #54 in Harvetracker.
+
+**Pre-publish polish branch (deferred):** encryption at rest for `access_keys.secret`, admin-UI auth via access keys (instead of HTTP Basic). Card #56.
+
+**Tier-2 S3 wire polish:** `x-amz-bucket-region` on HeadBucket, multi-range GET → `multipart/byteranges`, list-buckets pagination, object-level tagging stubs, POST-form upload. Card #46. Revisit if a client surprises us.
+
+**Admin UI polish (cards #50–52):**
+- Visual: loading states, sidebar nav, mobile collapse, empty-state illustrations.
+- Functional gaps: pagination on bucket browser (currently capped at 100/prefix), bulk select + delete, sortable columns, search-keys-within-a-bucket, folder rename / prefix move.
+- Image-aware: grid view for image-heavy buckets, lightbox with arrow-key nav, side-by-side compare, EXIF in object detail, derived-thumbnail caching.
+
+**Smaller follow-ups:**
+- LiveView test scaffolding (skipped LV-specific tests in PR3/PR4 of the access-control-lists branch).
+- `Kafun.Auth` legacy surface cleanup — `access_key/1`, `allowed?/1`, `disabled?/0` are no longer called by the router.
+- The `:empty_secret` bypass should sunset once env-bootstrapped keys have all rotated to real secrets.
+- Bare-metal `rel/openrc/` and `rel/systemd/` siblings if shipping to non-Void targets.
