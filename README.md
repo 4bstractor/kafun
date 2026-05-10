@@ -50,7 +50,7 @@ echo "KAFUN_KEYS=AKIAEXAMPLEKEY"                  >> .env
 # docker-compose.yml
 services:
   kafun:
-    image: ghcr.io/4bstractor/kafun:latest
+    image: gitea.harvelab.com/harvelab/kafun:latest
     restart: unless-stopped
     ports:
       - "8333:8333"   # S3 API
