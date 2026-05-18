@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  REGISTRY: gitea.harvelab.com
+  REGISTRY: artifacts.harvelab.com
   IMAGE_NAME: ${{ gitea.repository }}
 
 jobs:
@@ -21,10 +21,10 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ gitea.actor }}
+          username: ci-pusher
           # Prefer a PAT (REGISTRY_TOKEN secret) with write:package scope.
           # Falls back to the auto-provided Actions token under either name.
-          password: ${{ secrets.REGISTRY_TOKEN || secrets.GITEA_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GIYOUDEN_PUSH_TOKEN }}
 
       - name: Derive image tags and labels
         id: meta
