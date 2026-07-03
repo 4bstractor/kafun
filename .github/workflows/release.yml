@@ -1,50 +1,42 @@
+# GitHub Actions only — Gitea uses .gitea/workflows/ (its presence makes
+# Gitea skip this directory entirely). Publishes the public ghcr.io image.
 name: release
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: {}
-
-env:
-  REGISTRY: artifacts.harvelab.com
-  IMAGE_NAME: ${{ gitea.repository }}
 
 jobs:
   publish:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to homelab registry
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ci-pusher
-          # Prefer a PAT (REGISTRY_TOKEN secret) with write:package scope.
-          # Falls back to the auto-provided Actions token under either name.
-          password: ${{ secrets.GIYOUDEN_PUSH_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image tags and labels
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
-            type=raw,value=latest,enable=${{ gitea.ref == 'refs/heads/master' }}
+      - name: Derive image tags
+        id: tags
+        run: |
+          ref="${GITHUB_REF#refs/tags/}"
+          version="${ref#v}"
+          {
+            echo "version=$version"
+            echo "tags=ghcr.io/${{ github.repository_owner }}/kafun:$version,ghcr.io/${{ github.repository_owner }}/kafun:latest"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

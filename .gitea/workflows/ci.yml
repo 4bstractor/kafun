@@ -1,16 +1,15 @@
-# GitHub Actions only — Gitea uses .gitea/workflows/ (its presence makes
-# Gitea skip this directory entirely).
+# Gitea Actions only — GitHub ignores .gitea/. The GitHub CI variant lives
+# in .github/workflows/ci.yml.
 name: ci
 
 on:
   push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+    branches: ["**"]
+  workflow_dispatch: {}
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       MIX_ENV: test
     steps:

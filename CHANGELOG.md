@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] — 2026-05-08
+### Changed
+
+- Split CI/release workflows by host: `.gitea/workflows/` publishes the
+  homelab image to giyouden (artifacts.harvelab.com); `.github/workflows/`
+  publishes the public image to ghcr.io. Gitea skips `.github/workflows/`
+  when `.gitea/workflows/` exists, so one branch serves both remotes.
+
+## [0.2] — 2026-05-18
+
+### Changed
+
+- Release workflow publishes to the giyouden homelab registry
+  (artifacts.harvelab.com) instead of ghcr.io.
+
+## [0.1.1] — 2026-05-10
+
+### Fixed
+
+- Gitea Actions compatibility in CI and release workflows
+  (`runs-on: ubuntu-22.04`, local packaging fixes).
+
+## [0.1] — 2026-05-09
 
 First tagged cut. Production-deployed on yomi since 2026-05-03.
 
@@ -51,5 +72,7 @@ First tagged cut. Production-deployed on yomi since 2026-05-03.
 - Backup story still the docker-exec `Kafun.Backup.run/0` path; ZFS
   snapshot rework deferred.
 
-[Unreleased]: https://github.com/4bstractor/kafun/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/4bstractor/kafun/releases/tag/v0.1.0
+[Unreleased]: https://github.com/4bstractor/kafun/compare/v0.2...HEAD
+[0.2]: https://github.com/4bstractor/kafun/compare/v0.1.1...v0.2
+[0.1.1]: https://github.com/4bstractor/kafun/compare/v0.1...v0.1.1
+[0.1]: https://github.com/4bstractor/kafun/releases/tag/v0.1
