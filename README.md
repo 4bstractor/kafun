@@ -7,6 +7,8 @@ heavy lifting underneath.
 
 [![ci](https://github.com/4bstractor/kafun/actions/workflows/ci.yml/badge.svg)](https://github.com/4bstractor/kafun/actions/workflows/ci.yml)
 
+![bucket browser — listing, drag-and-drop upload, per-bucket permissions](docs/screenshots/bucket.png)
+
 ## When to use kafun
 
 You probably want kafun if:
@@ -100,6 +102,13 @@ The S3 surface and the admin UI are separate auth concerns by design.
 Admin UI is gated by HTTP Basic (`KAFUN_ADMIN_USER` /
 `KAFUN_ADMIN_PASSWORD`); the S3 surface is gated by SigV4 + the access
 key model below.
+
+![object detail — inline image preview, metadata, x-amz-meta round-trip](docs/screenshots/object.png)
+
+![access keys — generate, revoke, rotate](docs/screenshots/keys.png)
+
+(Want this locally? `priv/dev/seed_demo.exs` seeds the demo data these
+screenshots were taken against.)
 
 ## Auth
 

@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `COMPARISON.md` — positioning vs Garage, SeaweedFS, and MinIO
   (community edition archived Feb 2026), linked from the README.
+- Admin UI screenshots in the README (`docs/screenshots/`), plus
+  `priv/dev/seed_demo.exs` to regenerate the demo dataset behind them.
+
+### Fixed
+
+- Access-key listing crashed the Index GenServer in dev
+  (`String.to_existing_atom("revoked")` before any module interning
+  `:revoked` had loaded — dev loads modules lazily; prod releases were
+  unaffected). The status column now maps through an explicit
+  two-clause function.
+- Object detail page: dropped `loading="lazy"` from the image preview —
+  it's the page's sole above-the-fold content, so lazy-loading only
+  delayed first paint.
 
 ### Changed
 

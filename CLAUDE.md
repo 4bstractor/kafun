@@ -175,7 +175,7 @@ Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (d
 
 Mostly chasing public release at this point. The S3 surface and the admin UI cover all daily homelab flows. Open work, grouped:
 
-**Public release (Phase 1):** mostly done as of 2026-07-03 — LICENSE (Apache 2.0) ✓, README rewrite ✓, `ghcr.io/4bstractor/kafun` published on `v*` tags via the dual-workflow split ✓ (first public image: 0.2.1), CI on both hosts ✓, CHANGELOG + semver ✓, `COMPARISON.md` (vs Garage/SeaweedFS/archived-MinIO) ✓, backup story incl. non-ZFS hosts (DEPLOY.md §4) ✓. Remaining: README screenshots. (Historical card #54.)
+**Public release (Phase 1):** mostly done as of 2026-07-03 — LICENSE (Apache 2.0) ✓, README rewrite ✓, `ghcr.io/4bstractor/kafun` published on `v*` tags via the dual-workflow split ✓ (first public image: 0.2.1), CI on both hosts ✓, CHANGELOG + semver ✓, `COMPARISON.md` (vs Garage/SeaweedFS/archived-MinIO) ✓, backup story incl. non-ZFS hosts (DEPLOY.md §4) ✓, README screenshots (`docs/screenshots/`, regenerate via `priv/dev/seed_demo.exs` + headless firefox) ✓. **Phase 1 complete.** (Historical card #54.)
 
 **Pre-publish polish branch (deferred):** encryption at rest for `access_keys.secret`, admin-UI auth via access keys (instead of HTTP Basic). Card #56.
 
