@@ -992,12 +992,18 @@ defmodule Kafun.Index do
       id: id,
       secret: secret,
       description: desc,
-      status: String.to_existing_atom(status),
+      status: status_atom(status),
       created_at: created_at,
       revoked_at: revoked_at,
       last_used_at: last_used_at
     }
   end
+
+  # Not String.to_existing_atom/1: in dev's interactive mode nothing may
+  # have interned :revoked yet when the first row comes back, and the
+  # column is a closed two-value enum anyway.
+  defp status_atom("active"), do: :active
+  defp status_atom("revoked"), do: :revoked
 
   defp ensure_bucket_inline(state, name) do
     run(state, :ensure_bucket, [name, System.system_time(:second)])

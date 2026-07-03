@@ -256,7 +256,7 @@ defmodule Kafun.Admin.ObjectLive do
 
     <%= if image?(@meta, @key) do %>
       <div class="preview" style="margin-bottom: 1.25rem;">
-        <img src={preview_url(@bucket, @key)} alt={@key} loading="lazy" />
+        <img src={preview_url(@bucket, @key)} alt={@key} />
       </div>
     <% end %>
 
