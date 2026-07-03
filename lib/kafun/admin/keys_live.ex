@@ -87,6 +87,24 @@ defmodule Kafun.Admin.KeysLive do
     end
   end
 
+  def handle_event("toggle_admin_ui", %{"id" => id}, socket) do
+    with {:ok, key} <- Index.get_access_key(id),
+         :ok <- validate_admin_ui_toggle(key) do
+      :ok = Index.set_access_key_admin_ui(id, not key.admin_ui)
+
+      verb = if key.admin_ui, do: "disabled", else: "enabled"
+
+      {:noreply,
+       assign(socket,
+         keys: load_keys(),
+         notice: {:info, "admin UI access #{verb} for #{mask_id(id)}"}
+       )}
+    else
+      {:error, reason} -> {:noreply, assign(socket, notice: {:error, reason})}
+      :not_found -> {:noreply, assign(socket, notice: {:error, "key not found"})}
+    end
+  end
+
   def handle_event("rotate_secret", %{"id" => id}, socket) do
     new_secret = generate_secret()
 
@@ -142,6 +160,13 @@ defmodule Kafun.Admin.KeysLive do
   defp format_status(:active), do: "active"
   defp format_status(:revoked), do: "revoked"
 
+  defp validate_admin_ui_toggle(%{status: :revoked}), do: {:error, "revoked keys can't access the admin UI"}
+
+  defp validate_admin_ui_toggle(%{admin_ui: false, secret: ""}),
+    do: {:error, "rotate this key to a real secret first — empty-secret keys can't log in"}
+
+  defp validate_admin_ui_toggle(_key), do: :ok
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -190,6 +215,7 @@ defmodule Kafun.Admin.KeysLive do
             <th>ID</th>
             <th>Description</th>
             <th>Status</th>
+            <th>Admin UI</th>
             <th>Created</th>
             <th>Last used</th>
             <th></th>
@@ -220,6 +246,20 @@ defmodule Kafun.Admin.KeysLive do
                 <span class={"pill pill-#{format_status(key.status)}"}>
                   {format_status(key.status)}
                 </span>
+              </td>
+              <td>
+                <%= if key.status == :active do %>
+                  <button class="btn btn-link" phx-click="toggle_admin_ui" phx-value-id={key.id}
+                          title={if key.admin_ui,
+                            do: "This key can log in to the admin UI (Basic auth: key id / secret). Click to disable.",
+                            else: "Allow this key to log in to the admin UI. Requires a real (non-empty) secret."}
+                          data-confirm={unless key.admin_ui,
+                            do: "Allow #{mask_id(key.id)} to authenticate to the admin UI? Once any key has admin UI access, the UI requires login even if KAFUN_ADMIN_PASSWORD is unset."}>
+                    {if key.admin_ui, do: "✓ enabled", else: "—"}
+                  </button>
+                <% else %>
+                  —
+                <% end %>
               </td>
               <td>{format_date(key.created_at)}</td>
               <td>{format_date(key.last_used_at)}</td>

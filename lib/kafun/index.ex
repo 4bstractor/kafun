@@ -179,7 +179,8 @@ defmodule Kafun.Index do
           status: :active | :revoked,
           created_at: integer(),
           revoked_at: integer() | nil,
-          last_used_at: integer() | nil
+          last_used_at: integer() | nil,
+          admin_ui: boolean()
         }
 
   @type permission :: :read | :write | :admin
@@ -187,7 +188,7 @@ defmodule Kafun.Index do
   @doc "Insert a new access key. Idempotent — re-creating an existing id replaces nothing (no-op)."
   @spec create_access_key(String.t(), String.t(), String.t()) :: :ok
   def create_access_key(id, secret, description \\ "") do
-    GenServer.call(@name, {:create_access_key, id, secret, description})
+    GenServer.call(@name, {:create_access_key, id, Kafun.Vault.encrypt(secret), description})
   end
 
   @spec get_access_key(String.t()) :: {:ok, access_key_record()} | :not_found
@@ -202,8 +203,35 @@ defmodule Kafun.Index do
 
   @spec set_access_key_secret(String.t(), String.t()) :: :ok | :not_found
   def set_access_key_secret(id, secret) do
-    GenServer.call(@name, {:set_access_key_secret, id, secret})
+    GenServer.call(@name, {:set_access_key_secret, id, Kafun.Vault.encrypt(secret)})
   end
+
+  @doc "Allow (or disallow) this key to authenticate to the admin UI. See `Kafun.Admin.Auth`."
+  @spec set_access_key_admin_ui(String.t(), boolean()) :: :ok | :not_found
+  def set_access_key_admin_ui(id, allowed?) do
+    GenServer.call(@name, {:set_access_key_admin_ui, id, allowed?})
+  end
+
+  @doc "True when at least one active, non-empty-secret key has admin_ui — i.e. key auth is in play."
+  @spec admin_ui_keys?() :: boolean()
+  def admin_ui_keys?, do: GenServer.call(@name, :admin_ui_keys?)
+
+  @doc """
+  One-way migration: encrypt any plaintext, non-empty secrets under the
+  current master key. No-op when the vault is disabled. Returns the number
+  of rows rewritten. Called on boot by `Kafun.Application`.
+  """
+  @spec encrypt_plaintext_secrets() :: non_neg_integer()
+  def encrypt_plaintext_secrets, do: GenServer.call(@name, :encrypt_plaintext_secrets)
+
+  @doc """
+  Rotation: decrypt every encrypted secret with `old_master`, re-encrypt
+  under the current `KAFUN_MASTER_KEY` (or back to plaintext when unset).
+  Plaintext rows are picked up too when the vault is enabled. All-or-nothing:
+  if any row fails to decrypt, nothing is written.
+  """
+  @spec rekey_secrets(String.t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def rekey_secrets(old_master), do: GenServer.call(@name, {:rekey_secrets, old_master}, 30_000)
 
   @spec set_access_key_description(String.t(), String.t()) :: :ok | :not_found
   def set_access_key_description(id, description) do
@@ -355,7 +383,8 @@ defmodule Kafun.Index do
         "ALTER TABLE parts ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE objects ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'",
         "ALTER TABLE uploads ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'",
-        "ALTER TABLE buckets ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0"
+        "ALTER TABLE buckets ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE access_keys ADD COLUMN admin_ui INTEGER NOT NULL DEFAULT 0"
       ],
       fn sql ->
         case Sqlite3.execute(conn, sql) do
@@ -425,12 +454,12 @@ defmodule Kafun.Index do
         """),
       get_access_key:
         prep(conn, """
-        SELECT id, secret, description, status, created_at, revoked_at, last_used_at
+        SELECT id, secret, description, status, created_at, revoked_at, last_used_at, admin_ui
         FROM access_keys WHERE id = ?
         """),
       list_access_keys:
         prep(conn, """
-        SELECT id, secret, description, status, created_at, revoked_at, last_used_at
+        SELECT id, secret, description, status, created_at, revoked_at, last_used_at, admin_ui
         FROM access_keys ORDER BY created_at DESC
         """),
       revoke_access_key:
@@ -439,6 +468,13 @@ defmodule Kafun.Index do
         prep(conn, "UPDATE access_keys SET secret = ? WHERE id = ?"),
       set_access_key_description:
         prep(conn, "UPDATE access_keys SET description = ? WHERE id = ?"),
+      set_access_key_admin_ui:
+        prep(conn, "UPDATE access_keys SET admin_ui = ? WHERE id = ?"),
+      admin_ui_keys:
+        prep(conn, """
+        SELECT 1 FROM access_keys
+        WHERE status = 'active' AND admin_ui = 1 AND secret != '' LIMIT 1
+        """),
       touch_access_key_last_used:
         prep(conn, "UPDATE access_keys SET last_used_at = ? WHERE id = ?"),
       upsert_grant:
@@ -680,6 +716,78 @@ defmodule Kafun.Index do
     else
       run(state, :set_access_key_description, [desc, id])
       {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:set_access_key_admin_ui, id, allowed?}, _from, state) do
+    if fetch_one(state, :get_access_key, [id]) == nil do
+      {:reply, :not_found, state}
+    else
+      run(state, :set_access_key_admin_ui, [bool_to_int(allowed?), id])
+      {:reply, :ok, state}
+    end
+  end
+
+  def handle_call(:admin_ui_keys?, _from, state) do
+    {:reply, fetch_one(state, :admin_ui_keys, []) != nil, state}
+  end
+
+  def handle_call(:encrypt_plaintext_secrets, _from, state) do
+    count =
+      if Kafun.Vault.enabled?() do
+        state
+        |> fetch_all(:list_access_keys, [])
+        |> Enum.count(fn [id, secret | _] ->
+          if secret != "" and not Kafun.Vault.encrypted?(secret) do
+            run(state, :set_access_key_secret, [Kafun.Vault.encrypt(secret), id])
+            true
+          else
+            false
+          end
+        end)
+      else
+        0
+      end
+
+    {:reply, count, state}
+  end
+
+  def handle_call({:rekey_secrets, old_master}, _from, state) do
+    alias Kafun.Vault
+
+    rows = fetch_all(state, :list_access_keys, [])
+
+    # Resolve every row to plaintext first; write nothing unless all decrypt.
+    resolved =
+      Enum.map(rows, fn [id, secret | _] ->
+        cond do
+          secret == "" -> {:skip, id}
+          not Vault.encrypted?(secret) -> {:plain, id, secret}
+          true ->
+            case Vault.decrypt_with(secret, old_master) do
+              {:ok, plaintext} -> {:plain, id, plaintext}
+              :error -> {:undecryptable, id}
+            end
+        end
+      end)
+
+    case Enum.filter(resolved, &match?({:undecryptable, _}, &1)) do
+      [] ->
+        rewritten =
+          Enum.count(resolved, fn
+            {:plain, id, plaintext} ->
+              stored = Vault.encrypt(plaintext)
+              run(state, :set_access_key_secret, [stored, id])
+              true
+
+            {:skip, _} ->
+              false
+          end)
+
+        {:reply, {:ok, rewritten}, state}
+
+      bad ->
+        {:reply, {:error, {:undecryptable, Enum.map(bad, fn {_, id} -> id end)}}, state}
     end
   end
 
@@ -987,15 +1095,16 @@ defmodule Kafun.Index do
   defp bool_to_int(true), do: 1
   defp bool_to_int(false), do: 0
 
-  defp access_key_row([id, secret, desc, status, created_at, revoked_at, last_used_at]) do
+  defp access_key_row([id, secret, desc, status, created_at, revoked_at, last_used_at, admin_ui]) do
     %{
       id: id,
-      secret: secret,
+      secret: Kafun.Vault.decrypt(secret),
       description: desc,
       status: status_atom(status),
       created_at: created_at,
       revoked_at: revoked_at,
-      last_used_at: last_used_at
+      last_used_at: last_used_at,
+      admin_ui: admin_ui == 1
     }
   end
 
