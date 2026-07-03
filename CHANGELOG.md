@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `COMPARISON.md` — positioning vs Garage, SeaweedFS, and MinIO
+  (community edition archived Feb 2026), linked from the README.
+
 ## [0.2.1] — 2026-07-03
 
 First release published to both registries: `ghcr.io/4bstractor/kafun`

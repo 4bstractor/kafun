@@ -175,7 +175,7 @@ Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (d
 
 Mostly chasing public release at this point. The S3 surface and the admin UI cover all daily homelab flows. Open work, grouped:
 
-**Public release (Phase 1):** license file (Apache 2.0 leaning), README rewrite with screenshots + positioning vs MinIO/SeaweedFS/Garage, published `ghcr.io/4bstractor/kafun:0.1.0` image via GitHub Actions on tag, CI running `mix test` on push, CHANGELOG.md + commit to semver, comparison doc, backup story for non-ZFS users. Card #54 in Harvetracker.
+**Public release (Phase 1):** mostly done as of 2026-07-03 — LICENSE (Apache 2.0) ✓, README rewrite ✓, `ghcr.io/4bstractor/kafun` published on `v*` tags via the dual-workflow split ✓ (first public image: 0.2.1), CI on both hosts ✓, CHANGELOG + semver ✓, `COMPARISON.md` (vs Garage/SeaweedFS/archived-MinIO) ✓. Remaining: README screenshots, backup story for non-ZFS users. (Historical card #54.)
 
 **Pre-publish polish branch (deferred):** encryption at rest for `access_keys.secret`, admin-UI auth via access keys (instead of HTTP Basic). Card #56.
 

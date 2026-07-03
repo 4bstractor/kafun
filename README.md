@@ -25,15 +25,18 @@ You probably don't want kafun if:
 
 - You need HA, replication, or multi-node anything. (Use [Garage] or
   [SeaweedFS].)
-- You need IAM, SSE-KMS, versioning, object lock, lifecycle rules, or
-  any other big-S3 feature. (Use [MinIO] or actual S3.)
+- You need IAM, SSE, versioning, object lock, lifecycle rules, or
+  any other big-S3 feature. (Use [SeaweedFS] or actual S3. MinIO's
+  community edition was archived in early 2026.)
 - You're storing billions of objects. SQLite + a single GenServer
   serializes the metadata path; it's fine for tens of millions, not
   designed for billions.
 
+The longer, honest version — including what happens to your bytes on
+disk under each system — is in [COMPARISON.md](./COMPARISON.md).
+
 [Garage]: https://garagehq.deuxfleurs.fr/
 [SeaweedFS]: https://github.com/seaweedfs/seaweedfs
-[MinIO]: https://min.io/
 
 ## Quickstart
 
