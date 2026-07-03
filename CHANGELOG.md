@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Encryption at rest for access-key secrets (`Kafun.Vault`): set
+  `KAFUN_MASTER_KEY` and secrets are stored AES-256-GCM-encrypted in the
+  SQLite index. Existing plaintext rows are encrypted on next boot;
+  rotation via `kafun rpc 'Kafun.Vault.rekey("old-master")'` (also
+  rotates back to plaintext when the vault is disabled). Unset means
+  plaintext — the original homelab default — and empty (env-bootstrap)
+  secrets are never encrypted.
+- Admin-UI login with access keys: flag a key with "Admin UI" on the
+  `/keys` page and authenticate as `<key id>:<secret>` over HTTP Basic.
+  The shared `KAFUN_ADMIN_USER`/`KAFUN_ADMIN_PASSWORD` credential stays
+  as the bootstrap path; the UI is open only when neither is configured.
+
+### Removed
+
+- Orphaned pre-ACL functions `Kafun.Auth.access_key/1`, `allowed?/1`,
+  `disabled?/0` (nothing called them since the access-control-lists
+  branch).
+
 ## [0.2.2] — 2026-07-03
 
 ### Added

@@ -16,7 +16,8 @@ Kafun is an S3-compatible blob service for the homelab. **Elixir / OTP 27 / Band
 | `lib/kafun/index.ex`         | Single-conn SQLite GenServer with prepared statements. Tables: `objects`, `buckets`, `uploads`, `parts`. Listing scanner with prefix + delimiter + paginated continuation lives here. |
 | `lib/kafun/multipart.ex`     | Initiate / upload-part / complete / abort orchestration. Computes the `md5-of-md5s-N` ETag. |
 | `lib/kafun/gc.ex`            | Tick-based janitor — three passes (abandoned uploads, orphan part dirs, orphan blobs / leftover tmps). Caches its last-run summary for the admin Status page. Emits `[:kafun, :gc, :run]`. |
-| `lib/kafun/auth.ex`          | The central inbound-auth gate. `authorize/2` (per-bucket, action-tier) and `authorize_service/2` (ListAllMyBuckets, CreateBucket). Real SigV4 verification + grant lookup + anonymous public-read fallthrough. Legacy `access_key/1`/`allowed?/1`/`disabled?/0` still present (orphaned, slated for removal). |
+| `lib/kafun/auth.ex`          | The central inbound-auth gate. `authorize/2` (per-bucket, action-tier) and `authorize_service/2` (ListAllMyBuckets, CreateBucket). Real SigV4 verification + grant lookup + anonymous public-read fallthrough. (Legacy `access_key/1`/`allowed?/1`/`disabled?/0` removed on the pre_publish_polish branch.) |
+| `lib/kafun/vault.ex`         | Encryption at rest for `access_keys.secret`. AES-256-GCM, data key derived from `KAFUN_MASTER_KEY`, stored as `enc:v1:<base64>`. Plaintext passthrough when disabled; boot sweeps plaintext rows via `Index.encrypt_plaintext_secrets/0`; rotation via `Vault.rekey/1` (rpc). Fails closed. |
 | `lib/kafun/auth/sigv4.ex`    | AWS SigV4. `sign/4` (used by the migrator) and `verify/2` (used by the inbound gate). Header form fully verified; querystring (presigned URLs) returns `:unverified` for now. |
 | `lib/kafun/s3_xml.ex`        | iolist XML builders for every S3 response shape we emit + Saxy parser for the CompleteMultipartUpload and Multi-Object Delete bodies. |
 | `lib/kafun/admin/`           | Phoenix admin UI. `Endpoint`/`Router`/`Layouts`/`Auth` plus six LiveViews: `BucketsLive` (index with public-read badges + create/delete), `BucketLive` (paginated browser, prefix nav, drag-and-drop upload, per-row delete, embedded permissions panel), `ObjectLive` (preview + meta view/edit, rename, delete), `UploadsLive` (in-flight multiparts + abort), `StatusLive` (GC + telemetry counters), `KeysLive` (access-key generate/revoke/edit/rotate). Bound to `KAFUN_ADMIN_PORT` (default 8334). |
@@ -56,7 +57,8 @@ For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix rele
 | `KAFUN_GC_ABANDON_AFTER_SEC`  | `86400`                | Multipart uploads older than this get aborted. |
 | `KAFUN_GC_BLOB_GRACE_SEC`     | `3600`                 | Orphan blobs / `.tmp.*` older than this get GC'd. |
 | `KAFUN_ADMIN_HOST` / `KAFUN_ADMIN_PORT` | `0.0.0.0` / `8334` | Phoenix admin UI bind. |
-| `KAFUN_ADMIN_USER` / `KAFUN_ADMIN_PASSWORD` | `admin` / *(empty)* | Basic-auth gate on the admin UI. Empty password leaves the UI open (trusted-network model). |
+| `KAFUN_ADMIN_USER` / `KAFUN_ADMIN_PASSWORD` | `admin` / *(empty)* | Legacy/bootstrap Basic-auth credential for the admin UI. Preferred model: flag an access key with `admin_ui` on `/keys` and log in as `<key id>:<secret>`. UI is open only when neither env password nor any admin_ui key is configured. |
+| `KAFUN_MASTER_KEY`            | *(empty = plaintext)*  | Enables `Kafun.Vault` encryption at rest for `access_keys.secret`. Existing plaintext rows are encrypted on next boot. Rotate: `kafun rpc 'Kafun.Vault.rekey("old")'`. |
 | `KAFUN_ADMIN_SECRET`          | *(generated per boot)* | 64+ byte session signing key. Set to keep sessions across restarts. **Required in prod.** |
 | `KAFUN_ADMIN_ALLOWED_ORIGINS` | *(empty = no check)*   | Comma-separated CORS origins for the LiveView websocket. Empty disables origin checking — appropriate for trusted LAN behind NPM. Set explicitly to lock down (e.g. `https://kafun.harvelab.com,http://yomi:8334`). |
 | `KAFUN_PUBLIC_S3_URL`         | *(empty = falls back to KAFUN_HOST:KAFUN_PORT)* | Externally reachable URL of the S3 surface. The admin's image-preview `<img src=…>` uses this base so the browser can fetch images from a different machine than the admin UI. |
@@ -141,7 +143,7 @@ For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix rele
 
 Edit-metadata writes directly via `Index.put/7`, bypassing HTTP since same-key meta-only update is just an index row update. Rename is `Storage.copy_blob` + `Index.put` + `Storage.delete` + `Index.delete`. Drag-and-drop upload uses Phoenix LV's `allow_upload` primitives + a `Storage.import_file/4` helper that does the same temp+rename + inline-MD5 dance as a wire PUT.
 
-**Admin UI auth model.** HTTP Basic via `KAFUN_ADMIN_PASSWORD` (single shared credential — no user/identity model in v1, deliberately). Migrating the admin UI itself to authenticate via access keys (with a per-key `admin_ui_access` flag) is parked in the pre-publish polish branch. The S3 surface and the admin UI are separate auth concerns by design.
+**Admin UI auth model.** HTTP Basic with two credential sources, checked by `Kafun.Admin.Auth`: (1) any active access key with the `admin_ui` flag and a non-empty secret authenticates as `<key id>:<secret>` (constant-time compare, touches `last_used_at`); (2) the shared `KAFUN_ADMIN_USER`/`KAFUN_ADMIN_PASSWORD` env pair, kept as the bootstrap/back-compat path. Open only when neither is configured — flagging the first key locks the UI. Empty-secret keys never count (`Index.admin_ui_keys?/0` excludes them). The flag is toggled per key on `/keys`; revoked and empty-secret keys can't be flagged. The S3 surface and the admin UI remain separate auth concerns by design.
 
 ## What's left for S3 parity
 
@@ -161,7 +163,7 @@ Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (d
 
 - **Versioning, IAM, server-side encryption (SSE-S3/KMS/C), object lock, replication, lifecycle rules, inventory, intelligent-tiering, CORS, website hosting.** Deferred — homelab use doesn't need them. If implemented later, most are stub responses; only versioning would touch the index schema.
 - **Bucket policies (the JSON-document kind).** The simple grant model (read/write/admin per (key, bucket)) is the contract. Policy documents would be a parallel model.
-- **Encryption at rest for `access_keys.secret`.** Plain text in SQLite is fine for homelab (file-perms-protected on a ZFS dataset). Parked in the pre-publish polish branch — needs a key-derivation strategy and re-encryption tooling for rotation.
+- **Encryption at rest for `access_keys.secret`.** Done on the pre_publish_polish branch — `Kafun.Vault`, `KAFUN_MASTER_KEY`-derived AES-256-GCM, boot auto-migration, `Vault.rekey/1` rotation. Plaintext remains the default when the env var is unset.
 
 ### Other known unknowns
 
@@ -177,7 +179,7 @@ Mostly chasing public release at this point. The S3 surface and the admin UI cov
 
 **Public release (Phase 1):** mostly done as of 2026-07-03 — LICENSE (Apache 2.0) ✓, README rewrite ✓, `ghcr.io/4bstractor/kafun` published on `v*` tags via the dual-workflow split ✓ (first public image: 0.2.1), CI on both hosts ✓, CHANGELOG + semver ✓, `COMPARISON.md` (vs Garage/SeaweedFS/archived-MinIO) ✓, backup story incl. non-ZFS hosts (DEPLOY.md §4) ✓, README screenshots (`docs/screenshots/`, regenerate via `priv/dev/seed_demo.exs` + headless firefox) ✓. **Phase 1 complete.** (Historical card #54.)
 
-**Pre-publish polish branch (deferred):** encryption at rest for `access_keys.secret`, admin-UI auth via access keys (instead of HTTP Basic). Card #56.
+**Pre-publish polish branch (in review):** encryption at rest for `access_keys.secret` (`Kafun.Vault`) and admin-UI auth via access keys (per-key `admin_ui` flag) both landed on `pre_publish_polish`. (Historical card #56.)
 
 **Tier-2 S3 wire polish:** `x-amz-bucket-region` on HeadBucket, multi-range GET → `multipart/byteranges`, list-buckets pagination, object-level tagging stubs, POST-form upload. Card #46. Revisit if a client surprises us.
 
@@ -188,6 +190,6 @@ Mostly chasing public release at this point. The S3 surface and the admin UI cov
 
 **Smaller follow-ups:**
 - LiveView test scaffolding (skipped LV-specific tests in PR3/PR4 of the access-control-lists branch).
-- `Kafun.Auth` legacy surface cleanup — `access_key/1`, `allowed?/1`, `disabled?/0` are no longer called by the router.
+- ~~`Kafun.Auth` legacy surface cleanup~~ — removed on the pre_publish_polish branch.
 - The `:empty_secret` bypass should sunset once env-bootstrapped keys have all rotated to real secrets.
 - Bare-metal `rel/openrc/` and `rel/systemd/` siblings if shipping to non-Void targets.

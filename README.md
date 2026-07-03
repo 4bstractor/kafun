@@ -99,9 +99,12 @@ LiveView dashboard:
 - GC and telemetry counter status.
 
 The S3 surface and the admin UI are separate auth concerns by design.
-Admin UI is gated by HTTP Basic (`KAFUN_ADMIN_USER` /
-`KAFUN_ADMIN_PASSWORD`); the S3 surface is gated by SigV4 + the access
-key model below.
+The admin UI is gated by HTTP Basic with two credential sources: any
+access key flagged "Admin UI" on the `/keys` page logs in as
+`<key id>:<secret>` (per-client, revocable, rotatable), and the shared
+`KAFUN_ADMIN_USER` / `KAFUN_ADMIN_PASSWORD` env pair remains as the
+bootstrap path. The UI is open only when neither is configured. The S3
+surface is gated by SigV4 + the access key model below.
 
 ![object detail — inline image preview, metadata, x-amz-meta round-trip](docs/screenshots/object.png)
 
@@ -130,6 +133,12 @@ secret in the admin UI to opt in.
 `KAFUN_AUTH_DISABLED=true` is a recovery-only escape hatch that
 short-circuits all gating to allow.
 
+Secrets are stored in the SQLite index — plaintext by default (the
+original trusted-box model), or encrypted at rest with AES-256-GCM when
+`KAFUN_MASTER_KEY` is set. Existing rows are encrypted on the next
+boot; rotate with `kafun rpc 'Kafun.Vault.rekey("old-master-key")'`.
+Losing the master key means re-generating secrets, not losing data.
+
 ## Configuration
 
 | Env var                                 | Default                  | Notes |
@@ -144,6 +153,7 @@ short-circuits all gating to allow.
 | `KAFUN_PUBLIC_S3_URL`                   | *(falls back to host:port)* | Externally reachable URL of the S3 surface, used for admin UI image previews. |
 | `KAFUN_KEYS`                            | *(empty)*                | Bootstrap access keys. Each entry → access_keys row with empty secret + global admin grant. |
 | `KAFUN_BOOTSTRAP_BUCKETS`               | *(empty)*                | Comma-separated bucket names. Created on boot if absent. |
+| `KAFUN_MASTER_KEY`                      | *(empty = plaintext)*    | Encrypts access-key secrets at rest (AES-256-GCM). See Auth. |
 | `KAFUN_AUTH_DISABLED`                   | `false`                  | Recovery escape hatch. |
 | `KAFUN_LOG_LEVEL`                       | `info`                   | |
 | `KAFUN_GC_INTERVAL_SEC`                 | `3600`                   | `0` disables periodic sweeps. |
