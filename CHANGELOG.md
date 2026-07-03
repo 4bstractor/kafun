@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-07-03
+
+First release published to both registries: `ghcr.io/4bstractor/kafun`
+(public) and the homelab registry.
+
 ### Changed
 
 - Split CI/release workflows by host: `.gitea/workflows/` publishes the
@@ -72,7 +77,8 @@ First tagged cut. Production-deployed on yomi since 2026-05-03.
 - Backup story still the docker-exec `Kafun.Backup.run/0` path; ZFS
   snapshot rework deferred.
 
-[Unreleased]: https://github.com/4bstractor/kafun/compare/v0.2...HEAD
+[Unreleased]: https://github.com/4bstractor/kafun/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/4bstractor/kafun/compare/v0.2...v0.2.1
 [0.2]: https://github.com/4bstractor/kafun/compare/v0.1.1...v0.2
 [0.1.1]: https://github.com/4bstractor/kafun/compare/v0.1...v0.1.1
 [0.1]: https://github.com/4bstractor/kafun/releases/tag/v0.1
