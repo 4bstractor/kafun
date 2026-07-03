@@ -1008,6 +1008,114 @@ defmodule KafunTest do
     end
   end
 
+  describe "Admin.Auth (admin UI gate)" do
+    alias Kafun.Admin.Auth, as: AdminAuth
+
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-adminauth-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      start_supervised!({Index, db_path: db})
+
+      previous = Application.get_env(:kafun, :admin_password)
+
+      on_exit(fn ->
+        Application.put_env(:kafun, :admin_password, previous)
+        File.rm_rf!(tmp)
+      end)
+
+      :ok
+    end
+
+    defp admin_conn(creds \\ nil) do
+      conn = Plug.Test.conn(:get, "/")
+
+      conn =
+        case creds do
+          nil -> conn
+          {u, p} -> Plug.Conn.put_req_header(conn, "authorization", "Basic " <> Base.encode64("#{u}:#{p}"))
+        end
+
+      AdminAuth.call(conn, [])
+    end
+
+    test "open when neither env password nor admin_ui keys are configured" do
+      Application.put_env(:kafun, :admin_password, nil)
+      refute admin_conn().halted
+    end
+
+    test "legacy env credential still works; wrong password is rejected" do
+      Application.put_env(:kafun, :admin_password, "hunter2")
+
+      assert admin_conn().status == 401
+      assert admin_conn({"admin", "wrong"}).status == 401
+      refute admin_conn({"admin", "hunter2"}).halted
+    end
+
+    test "an admin_ui-flagged key authenticates with id:secret" do
+      Application.put_env(:kafun, :admin_password, nil)
+      :ok = Index.create_access_key("ADMKEY", "adm-secret", "")
+      :ok = Index.set_access_key_admin_ui("ADMKEY", true)
+
+      # Flagging the key locked the UI…
+      assert admin_conn().status == 401
+      # …and the key's own credential opens it.
+      refute admin_conn({"ADMKEY", "adm-secret"}).halted
+      assert admin_conn({"ADMKEY", "wrong"}).status == 401
+    end
+
+    test "keys without the flag, revoked keys, and empty passwords are rejected" do
+      Application.put_env(:kafun, :admin_password, nil)
+      :ok = Index.create_access_key("LOCK", "lock-secret", "")
+      :ok = Index.set_access_key_admin_ui("LOCK", true)
+
+      :ok = Index.create_access_key("NOFLAG", "no-flag-secret", "")
+      assert admin_conn({"NOFLAG", "no-flag-secret"}).status == 401
+
+      :ok = Index.create_access_key("GONE", "gone-secret", "")
+      :ok = Index.set_access_key_admin_ui("GONE", true)
+      :ok = Index.revoke_access_key("GONE")
+      assert admin_conn({"GONE", "gone-secret"}).status == 401
+
+      assert admin_conn({"LOCK", ""}).status == 401
+    end
+
+    test "empty-secret keys never count: the UI stays open even if flagged directly" do
+      Application.put_env(:kafun, :admin_password, nil)
+      :ok = Index.create_access_key("ENVKEY", "", "env-bootstrap")
+      :ok = Index.set_access_key_admin_ui("ENVKEY", true)
+
+      refute Index.admin_ui_keys?()
+      refute admin_conn().halted
+    end
+
+    test "key auth works with the vault enabled (encrypted secret at rest)" do
+      Application.put_env(:kafun, :admin_password, nil)
+      Application.put_env(:kafun, :master_key, "adm-master")
+      on_exit(fn -> Application.delete_env(:kafun, :master_key) end)
+
+      :ok = Index.create_access_key("VADM", "vault-adm-secret", "")
+      :ok = Index.set_access_key_admin_ui("VADM", true)
+
+      refute admin_conn({"VADM", "vault-adm-secret"}).halted
+    end
+
+    test "Index round-trips the admin_ui flag" do
+      :ok = Index.create_access_key("FLAG", "s", "")
+      assert {:ok, %{admin_ui: false}} = Index.get_access_key("FLAG")
+
+      :ok = Index.set_access_key_admin_ui("FLAG", true)
+      assert {:ok, %{admin_ui: true}} = Index.get_access_key("FLAG")
+      assert Index.admin_ui_keys?()
+
+      :ok = Index.set_access_key_admin_ui("FLAG", false)
+      assert {:ok, %{admin_ui: false}} = Index.get_access_key("FLAG")
+      refute Index.admin_ui_keys?()
+
+      assert :not_found = Index.set_access_key_admin_ui("ghost", true)
+    end
+  end
+
   describe "Index access keys + grants" do
     setup do
       tmp = Path.join(System.tmp_dir!(), "kafun-acl-#{System.unique_integer([:positive])}")
