@@ -20,7 +20,7 @@ Kafun is an S3-compatible blob service for the homelab. **Elixir / OTP 27 / Band
 | `lib/kafun/auth/sigv4.ex`    | AWS SigV4. `sign/4` (used by the migrator) and `verify/2` (used by the inbound gate). Header form fully verified; querystring (presigned URLs) returns `:unverified` for now. |
 | `lib/kafun/s3_xml.ex`        | iolist XML builders for every S3 response shape we emit + Saxy parser for the CompleteMultipartUpload and Multi-Object Delete bodies. |
 | `lib/kafun/admin/`           | Phoenix admin UI. `Endpoint`/`Router`/`Layouts`/`Auth` plus six LiveViews: `BucketsLive` (index with public-read badges + create/delete), `BucketLive` (paginated browser, prefix nav, drag-and-drop upload, per-row delete, embedded permissions panel), `ObjectLive` (preview + meta view/edit, rename, delete), `UploadsLive` (in-flight multiparts + abort), `StatusLive` (GC + telemetry counters), `KeysLive` (access-key generate/revoke/edit/rotate). Bound to `KAFUN_ADMIN_PORT` (default 8334). |
-| `lib/kafun/backup.ex`        | `Kafun.Backup.run/0` — wraps `Index.backup_to/1` with a default `/var/backups/kafun/kafun-<ts>.db` path. Cron-friendly via the release's `rpc` command. |
+| `lib/kafun/backup.ex`        | `Kafun.Backup.run/0` — wraps `Index.backup_to/1` (`VACUUM INTO`) with a default `/var/backups/kafun/kafun-<ts>.db` path. Cron-friendly via the release's `rpc` command. No longer the headline backup path — `DEPLOY.md` §4 leads with filesystem snapshots (ZFS/sanoid) and a host-side `VACUUM INTO` + rsync procedure for non-ZFS; this helper is the in-container fallback. |
 | `lib/kafun/migrate.ex`       | Pull migrator. Speaks S3 (Req + `Kafun.Auth.SigV4`) against any source endpoint, idempotently copies into the local kafun. `mix kafun.migrate` is the CLI entry point. |
 | `lib/mix/tasks/kafun.migrate.ex` | `mix kafun.migrate --src ... --bucket ...` — ergonomic CLI wrapper around `Kafun.Migrate.run/4`. |
 | `rel/`                       | Deploy artifacts: `kafun.env.example` env template (Docker-first; bind-mounts `/sanzu/objects` into `/data`). `sv/kafun/run` + `sv/kafun/log/run` runit tree kept as an "Alternative: bare metal" path documented in `DEPLOY.md`. |
@@ -175,7 +175,7 @@ Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (d
 
 Mostly chasing public release at this point. The S3 surface and the admin UI cover all daily homelab flows. Open work, grouped:
 
-**Public release (Phase 1):** mostly done as of 2026-07-03 — LICENSE (Apache 2.0) ✓, README rewrite ✓, `ghcr.io/4bstractor/kafun` published on `v*` tags via the dual-workflow split ✓ (first public image: 0.2.1), CI on both hosts ✓, CHANGELOG + semver ✓, `COMPARISON.md` (vs Garage/SeaweedFS/archived-MinIO) ✓. Remaining: README screenshots, backup story for non-ZFS users. (Historical card #54.)
+**Public release (Phase 1):** mostly done as of 2026-07-03 — LICENSE (Apache 2.0) ✓, README rewrite ✓, `ghcr.io/4bstractor/kafun` published on `v*` tags via the dual-workflow split ✓ (first public image: 0.2.1), CI on both hosts ✓, CHANGELOG + semver ✓, `COMPARISON.md` (vs Garage/SeaweedFS/archived-MinIO) ✓, backup story incl. non-ZFS hosts (DEPLOY.md §4) ✓. Remaining: README screenshots. (Historical card #54.)
 
 **Pre-publish polish branch (deferred):** encryption at rest for `access_keys.secret`, admin-UI auth via access keys (instead of HTTP Basic). Card #56.
 

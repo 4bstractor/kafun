@@ -10,7 +10,7 @@ Production deployment runbook for kafun on yomi (Void Linux, Docker).
 | `/srv/kafun/kafun.env` | (you choose) | Env vars — secrets live here, mode 640. |
 | `/srv/kafun/src/` | (you choose) | Source tree. `compose build` reads from here. Update via `rsync` from your dev box. |
 | `/sanzu/objects/` | (you choose) | ZFS dataset, blob storage + SQLite index. Bind-mounted to `/data` in the container. |
-| `/var/backups/kafun/` | (you choose) | Index snapshots written by the backup cron. |
+| `/backup/kafun/` | (you choose) | Backup destination for the non-ZFS path (§4). Not needed when ZFS snapshots are the backup. |
 
 The "you choose" ownership rows depend on whether you run the container as
 root (matches kavita / booksorter on yomi) or as a specific UID. Either
@@ -94,25 +94,108 @@ docker compose up -d         # picks up env_file changes on recreate
 
 ## 4. Backups
 
-Daily index snapshot via the release's `rpc` command. Add as root cron
-(`sudo crontab -e`):
+Two things to protect, both under `KAFUN_ROOT`: the blob tree (plain
+files, immutable once published — the temp+rename write discipline
+means a blob is never modified in place) and the SQLite index (WAL
+mode). The two stores tolerate small drift — the GC reconciles on the
+next sweep — so a good backup doesn't require stopping the service.
 
-```cron
-# Snapshot the index at 03:00 UTC every day, keep 14 days.
-0 3 * * * docker exec kafun /app/bin/kafun rpc 'Kafun.Backup.run("/data/.backups")'
-30 3 * * * find /sanzu/objects/.backups -name 'kafun-*.db' -mtime +14 -delete
+### If the data lives on ZFS (or btrfs / LVM-thin): snapshot the filesystem
+
+A filesystem snapshot captures blobs and index at a single instant —
+stronger consistency than anything below, and the recommended path.
+SQLite in WAL mode is crash-consistent: a snapshot is a crash image,
+and SQLite replays the `-wal` on next open.
+
+Schedule and prune with [sanoid], replicate offsite with `syncoid` /
+`zfs send`:
+
+```ini
+# /etc/sanoid/sanoid.conf
+[sanzu/objects]
+        use_template = production
+
+[template_production]
+        hourly = 24
+        daily = 14
+        monthly = 3
+        autosnap = yes
+        autoprune = yes
 ```
 
-The snapshot lands at `/sanzu/objects/.backups/kafun-<UTC-ts>.db` on
-yomi (because `/data/.backups` inside the container is the
-bind-mounted blob root). The blob tree itself is *not* backed up by
-this — point your existing tool (restic / rsync / borg) at
-`/sanzu/objects` for that. The two stores reconcile on restore: as
-long as both come back, the GC cleans any drift.
+Restore is a ZFS operation (`zfs rollback` or clone-and-copy); nothing
+kafun-specific. Do stop the container before rolling the live dataset
+back.
 
-(Alternative — if you'd prefer the snapshot outside the data dataset —
-bind-mount a second host path into the container and write there. Easy
-edit to `docker-compose.yml`.)
+[sanoid]: https://github.com/jimsalterjrs/sanoid
+
+### If not (ext4 / xfs): index snapshot, then blob rsync
+
+Without atomic snapshots, take the two stores in this order — index
+first, blobs second. Every row in the index copy references a blob
+that already existed when the rsync started (the index commit always
+happens *after* the blob rename), so the blob copy is a superset of
+what the index copy needs. The residue is harmless in both directions:
+keys deleted during the window leave dangling index rows (those GETs
+404 — the data was deleted anyway), keys written during the window
+leave orphan blobs (the GC reaps them after the grace window).
+
+```sh
+#!/bin/sh -e
+# /usr/local/bin/kafun-backup — run daily from cron.
+ROOT=/sanzu/objects        # KAFUN_ROOT on the host
+DEST=/backup/kafun         # wherever your backups land
+TS=$(date -u +%Y%m%d-%H%M%S)
+
+# 1. Index first. VACUUM INTO is a consistent point-in-time copy and
+#    is safe to run against the live WAL database from the host.
+mkdir -p "$DEST/index"
+sqlite3 "$ROOT/index.db" "VACUUM INTO '$DEST/index/kafun-$TS.db'"
+
+# 2. Blob tree second. Published blobs never change, so a live rsync
+#    is safe. Skip the live index files, in-flight multipart parts,
+#    and temp files — none of them belong in a backup.
+rsync -a --delete \
+  --exclude 'index.db*' \
+  --exclude '.uploads/' \
+  --exclude '*.tmp.*' \
+  "$ROOT/" "$DEST/blobs/"
+
+# 3. Prune old index snapshots.
+find "$DEST/index" -name 'kafun-*.db' -mtime +14 -delete
+```
+
+```cron
+0 3 * * * /usr/local/bin/kafun-backup
+```
+
+For versioned or offsite backups, swap step 2's rsync for restic or
+borg pointed at the same source with the same excludes — the ordering
+argument is unchanged. If you'd rather not install `sqlite3` on the
+host, `docker exec kafun /app/bin/kafun rpc 'Kafun.Backup.run("/data/.backups")'`
+produces the same `VACUUM INTO` snapshot from inside the container.
+
+### Stop-the-world (simplest correct thing)
+
+If a few seconds of nightly downtime is acceptable, skip the ordering
+argument entirely:
+
+```sh
+docker compose stop kafun
+cp / rsync / tar ...            # everything under $ROOT, minus .uploads/ and *.tmp.*
+docker compose start kafun
+```
+
+### Restore
+
+1. Stop the container.
+2. Put the blob tree back under `KAFUN_ROOT`.
+3. Put the chosen index snapshot back as `<root>/index.db`. Delete any
+   stale `index.db-wal` / `index.db-shm` sitting next to it — they
+   belong to the dead database, not the restored one.
+4. Start the container, then reconcile the drift window immediately
+   instead of waiting for the next sweep:
+   `docker exec kafun /app/bin/kafun rpc 'Kafun.GC.run_now()'`
 
 ## 5. Rollback
 
@@ -133,9 +216,9 @@ docker compose up -d
 
 The blob tree and SQLite index live outside the container on
 `/sanzu/objects/`, so rolling back the image never loses data. If a
-bad migration corrupted the index, restore the most recent
-`/sanzu/objects/.backups/kafun-*.db` to `/sanzu/objects/index.db`
-(stop the container first), then bring it back up.
+bad migration corrupted the index, restore your most recent index
+snapshot (see §4) following the Restore steps there — blobs stay in
+place, only `index.db` is swapped.
 
 ## 6. Day-2 ops
 

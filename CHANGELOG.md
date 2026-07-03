@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `COMPARISON.md` — positioning vs Garage, SeaweedFS, and MinIO
   (community edition archived Feb 2026), linked from the README.
 
+### Changed
+
+- `DEPLOY.md` backup section rewritten as a tiered story: filesystem
+  snapshots (sanoid/ZFS) as the recommended path, an ordered
+  `VACUUM INTO` + rsync procedure for non-ZFS hosts, a stop-the-world
+  variant, and explicit restore steps. Replaces the docker-exec
+  `Kafun.Backup.run/0` cron as the headline recommendation (the helper
+  remains as the in-container fallback).
+
 ## [0.2.1] — 2026-07-03
 
 First release published to both registries: `ghcr.io/4bstractor/kafun`
