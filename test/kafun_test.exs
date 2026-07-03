@@ -858,6 +858,156 @@ defmodule KafunTest do
     end
   end
 
+  describe "Vault (encryption primitives)" do
+    alias Kafun.Vault
+
+    setup do
+      on_exit(fn -> Application.delete_env(:kafun, :master_key) end)
+      :ok
+    end
+
+    test "disabled vault passes secrets through untouched" do
+      refute Vault.enabled?()
+      assert Vault.encrypt("hunter2") == "hunter2"
+      assert Vault.decrypt("hunter2") == "hunter2"
+    end
+
+    test "round-trips under a master key; ciphertext carries the version prefix" do
+      Application.put_env(:kafun, :master_key, "correct horse battery staple")
+      stored = Vault.encrypt("hunter2")
+
+      assert Vault.encrypted?(stored)
+      refute stored =~ "hunter2"
+      assert Vault.decrypt(stored) == "hunter2"
+    end
+
+    test "empty secret is never encrypted — it is the unverified-mode sentinel" do
+      Application.put_env(:kafun, :master_key, "some master key")
+      assert Vault.encrypt("") == ""
+    end
+
+    test "fails closed: wrong master key or tampered row returns the ciphertext" do
+      Application.put_env(:kafun, :master_key, "key A")
+      stored = Vault.encrypt("hunter2")
+
+      Application.put_env(:kafun, :master_key, "key B")
+      assert Vault.decrypt(stored) == stored
+
+      Application.put_env(:kafun, :master_key, "key A")
+      tampered = "enc:v1:" <> Base.encode64(:crypto.strong_rand_bytes(40))
+      assert Vault.decrypt(tampered) == tampered
+    end
+
+    test "fails closed when the master key disappears" do
+      Application.put_env(:kafun, :master_key, "key A")
+      stored = Vault.encrypt("hunter2")
+
+      Application.delete_env(:kafun, :master_key)
+      assert Vault.decrypt(stored) == stored
+    end
+  end
+
+  describe "Vault ↔ Index (encryption at rest)" do
+    alias Kafun.Vault
+
+    setup do
+      tmp = Path.join(System.tmp_dir!(), "kafun-vault-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db = Path.join(tmp, "index.db")
+      start_supervised!({Index, db_path: db})
+
+      on_exit(fn ->
+        Application.delete_env(:kafun, :master_key)
+        File.rm_rf!(tmp)
+      end)
+
+      :ok
+    end
+
+    test "secrets land encrypted on disk but read back as plaintext" do
+      Application.put_env(:kafun, :master_key, "master-1")
+      :ok = Index.create_access_key("VKEY", "topsecret", "")
+
+      assert {:ok, %{secret: "topsecret"}} = Index.get_access_key("VKEY")
+
+      # Peek under the vault: with the key gone, the stored value surfaces.
+      Application.delete_env(:kafun, :master_key)
+      assert {:ok, %{secret: stored}} = Index.get_access_key("VKEY")
+      assert Vault.encrypted?(stored)
+    end
+
+    test "encrypt_plaintext_secrets sweeps legacy plaintext rows, skips empty" do
+      :ok = Index.create_access_key("PLAIN", "legacy-secret", "")
+      :ok = Index.create_access_key("EMPTY", "", "env-bootstrap")
+
+      assert Index.encrypt_plaintext_secrets() == 0
+
+      Application.put_env(:kafun, :master_key, "master-1")
+      assert Index.encrypt_plaintext_secrets() == 1
+      assert Index.encrypt_plaintext_secrets() == 0
+
+      assert {:ok, %{secret: "legacy-secret"}} = Index.get_access_key("PLAIN")
+      assert {:ok, %{secret: ""}} = Index.get_access_key("EMPTY")
+    end
+
+    test "rekey_secrets rotates master keys all-or-nothing" do
+      Application.put_env(:kafun, :master_key, "master-old")
+      :ok = Index.create_access_key("RK1", "alpha", "")
+      :ok = Index.create_access_key("RK2", "beta", "")
+
+      Application.put_env(:kafun, :master_key, "master-new")
+      assert {:error, {:undecryptable, ids}} = Index.rekey_secrets("not-the-old-key")
+      assert Enum.sort(ids) == ["RK1", "RK2"]
+
+      assert {:ok, 2} = Index.rekey_secrets("master-old")
+      assert {:ok, %{secret: "alpha"}} = Index.get_access_key("RK1")
+      assert {:ok, %{secret: "beta"}} = Index.get_access_key("RK2")
+    end
+
+    test "rekey_secrets with the vault disabled rewrites back to plaintext" do
+      Application.put_env(:kafun, :master_key, "master-old")
+      :ok = Index.create_access_key("RK3", "gamma", "")
+
+      Application.delete_env(:kafun, :master_key)
+      assert {:ok, 1} = Index.rekey_secrets("master-old")
+
+      assert {:ok, %{secret: "gamma"}} = Index.get_access_key("RK3")
+    end
+
+    test "SigV4 gate still authorizes with encrypted secrets" do
+      alias Kafun.Auth.SigV4
+
+      Application.put_env(:kafun, :master_key, "master-1")
+      previous = Application.get_env(:kafun, :auth_disabled?, false)
+      Application.put_env(:kafun, :auth_disabled?, false)
+      on_exit(fn -> Application.put_env(:kafun, :auth_disabled?, previous) end)
+
+      :ok = Index.create_access_key("SIGKEY", "sigsecret", "")
+      :ok = Index.upsert_grant("SIGKEY", "vaultbucket", :write)
+
+      headers =
+        SigV4.sign(:put, "http://www.example.com/vaultbucket/k.txt", [],
+          access_key: "SIGKEY",
+          secret_key: "sigsecret",
+          payload: {:hash, ""},
+          now: DateTime.utc_now()
+        )
+
+      conn =
+        Enum.reduce(headers, Plug.Test.conn(:put, "/vaultbucket/k.txt", ""), fn {k, v}, c ->
+          name = String.downcase(k)
+
+          if name == "host" do
+            %{c | req_headers: [{"host", v} | c.req_headers]}
+          else
+            Plug.Conn.put_req_header(c, name, v)
+          end
+        end)
+
+      assert :ok = Kafun.Auth.authorize(conn, action: :write, bucket: "vaultbucket")
+    end
+  end
+
   describe "Index access keys + grants" do
     setup do
       tmp = Path.join(System.tmp_dir!(), "kafun-acl-#{System.unique_integer([:positive])}")

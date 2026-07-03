@@ -36,6 +36,12 @@ if level = System.get_env("KAFUN_LOG_LEVEL") do
   config :logger, level: String.to_atom(level)
 end
 
+# Encryption at rest for access_keys.secret (see Kafun.Vault). Only set
+# when explicitly present so tests can drive it via Application.put_env.
+if master = System.get_env("KAFUN_MASTER_KEY") do
+  config :kafun, master_key: master
+end
+
 # Set `auth_disabled?` only when KAFUN_AUTH_DISABLED is explicitly present.
 # Otherwise leave it to compile-time config (config/test.exs sets true so
 # unsigned-conn tests keep working). Default for prod (env unset) is the

@@ -39,9 +39,19 @@ defmodule Kafun.Application do
     if Application.get_env(:kafun, :start_children?, true) do
       bootstrap_buckets()
       bootstrap_env_keys()
+      encrypt_secrets_at_rest()
     end
 
     result
+  end
+
+  # When KAFUN_MASTER_KEY is set, sweep any plaintext secrets into the
+  # encrypted-at-rest format. Idempotent; no-op when the vault is disabled.
+  defp encrypt_secrets_at_rest do
+    case Kafun.Index.encrypt_plaintext_secrets() do
+      0 -> :ok
+      n -> Logger.info("kafun vault: encrypted #{n} plaintext access-key secret(s) at rest")
+    end
   end
 
   # Migrate KAFUN_KEYS env entries into the access_keys table on first boot
