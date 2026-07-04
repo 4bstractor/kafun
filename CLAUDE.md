@@ -63,6 +63,7 @@ For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix rele
 | `KAFUN_ADMIN_ALLOWED_ORIGINS` | *(empty = no check)*   | Comma-separated CORS origins for the LiveView websocket. Empty disables origin checking — appropriate for trusted LAN behind NPM. Set explicitly to lock down (e.g. `https://kafun.harvelab.com,http://yomi:8334`). |
 | `KAFUN_PUBLIC_S3_URL`         | *(empty = falls back to KAFUN_HOST:KAFUN_PORT)* | Externally reachable URL of the S3 surface. The admin's image-preview `<img src=…>` uses this base so the browser can fetch images from a different machine than the admin UI. |
 | `KAFUN_ADMIN_MAX_UPLOAD_MB`   | `256`                  | Per-file cap for the admin UI drag-and-drop upload. Browser-side rejects files larger than this. |
+| `KAFUN_ADMIN_MAX_UPLOAD_FILES` | `500`                 | Files-per-batch cap for the same upload (LiveView `max_entries`). Surplus files are auto-cancelled with a notice in the `validate` handler — LV's `:too_many_files` is a config-level error invisible on entry rows, so without the cancel they'd sit at 0% forever. |
 
 ## Architecture notes
 
@@ -189,7 +190,7 @@ Mostly chasing public release at this point. The S3 surface and the admin UI cov
 - Image-aware: grid view for image-heavy buckets, lightbox with arrow-key nav, side-by-side compare, EXIF in object detail, derived-thumbnail caching.
 
 **Smaller follow-ups:**
-- LiveView test scaffolding (skipped LV-specific tests in PR3/PR4 of the access-control-lists branch).
+- LiveView test scaffolding — seeded in `test/admin_live_test.exs` (endpoint with `server: false`, per-test Index + root, `lazy_html` test dep). BucketLive uploads covered; KeysLive/ObjectLive LV tests still to be written on that pattern.
 - ~~`Kafun.Auth` legacy surface cleanup~~ — removed on the pre_publish_polish branch.
 - The `:empty_secret` bypass should sunset once env-bootstrapped keys have all rotated to real secrets.
 - Bare-metal `rel/openrc/` and `rel/systemd/` siblings if shipping to non-Void targets.

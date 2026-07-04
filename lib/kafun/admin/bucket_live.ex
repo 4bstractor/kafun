@@ -16,6 +16,7 @@ defmodule Kafun.Admin.BucketLive do
   def mount(%{"bucket" => bucket}, _session, socket) do
     if Index.bucket_exists?(bucket) do
       max_mb = Application.get_env(:kafun, :admin_max_upload_mb, 256)
+      max_files = Application.get_env(:kafun, :admin_max_upload_files, 500)
 
       socket =
         socket
@@ -25,11 +26,12 @@ defmodule Kafun.Admin.BucketLive do
           upload_prefix: "",
           notice: nil,
           page_size_label: @page_size,
-          max_upload_mb: max_mb
+          max_upload_mb: max_mb,
+          max_upload_files: max_files
         )
         |> allow_upload(:files,
           accept: :any,
-          max_entries: 50,
+          max_entries: max_files,
           max_file_size: max_mb * 1024 * 1024,
           auto_upload: true,
           progress: &handle_progress/3
@@ -70,7 +72,29 @@ defmodule Kafun.Admin.BucketLive do
     {:noreply, assign(socket, upload_prefix: p)}
   end
 
-  def handle_event("validate", _params, socket), do: {:noreply, socket}
+  def handle_event("validate", _params, socket) do
+    conf = socket.assigns.uploads.files
+
+    # :too_many_files is a *config-level* error keyed to the upload ref, not
+    # to any entry — the surplus entries never get upload tokens and would
+    # sit at 0% forever with no visible error. Cancel them and say why.
+    if :too_many_files in upload_errors(conf) do
+      surplus = Enum.drop(conf.entries, conf.max_entries)
+
+      socket =
+        Enum.reduce(surplus, socket, fn entry, s -> cancel_upload(s, :files, entry.ref) end)
+
+      {:noreply,
+       assign(socket,
+         notice:
+           {:error,
+            "#{length(surplus)} file(s) skipped — max #{conf.max_entries} per batch. " <>
+              "Re-drop the skipped files once this batch finishes."}
+       )}
+    else
+      {:noreply, socket}
+    end
+  end
 
   def handle_event("cancel-upload", %{"ref" => ref}, socket) do
     {:noreply, cancel_upload(socket, :files, ref)}
@@ -268,11 +292,16 @@ defmodule Kafun.Admin.BucketLive do
       <label class="dropzone" phx-drop-target={@uploads.files.ref}>
         <div class="dropzone-headline">Drop files here, or click to choose.</div>
         <div class="dropzone-sub">
-          Max {@max_upload_mb} MiB per file. Filename becomes the key, prepended with the prefix above.
+          Max {@max_upload_mb} MiB per file, {@max_upload_files} files per batch.
+          Filename becomes the key, prepended with the prefix above.
           Conflicts on existing keys are refused — delete the old object first to replace it.
         </div>
         <.live_file_input upload={@uploads.files} />
       </label>
+
+      <%= for err <- upload_errors(@uploads.files) do %>
+        <div class="upload-err">{upload_error_text(err)}</div>
+      <% end %>
 
       <%= if @uploads.files.entries != [] do %>
         <div class="upload-list">

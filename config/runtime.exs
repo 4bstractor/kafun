@@ -116,4 +116,7 @@ config :kafun,
   public_s3_url: System.get_env("KAFUN_PUBLIC_S3_URL", ""),
   # Per-file cap for the admin UI drag-and-drop upload, in MiB. Browser-side
   # rejects files larger than this before they hit the server.
-  admin_max_upload_mb: System.get_env("KAFUN_ADMIN_MAX_UPLOAD_MB", "256") |> String.to_integer()
+  admin_max_upload_mb: System.get_env("KAFUN_ADMIN_MAX_UPLOAD_MB", "256") |> String.to_integer(),
+  # Files-per-batch cap for the same upload form. Files beyond this are
+  # skipped with a visible notice instead of silently stalling.
+  admin_max_upload_files: System.get_env("KAFUN_ADMIN_MAX_UPLOAD_FILES", "500") |> String.to_integer()

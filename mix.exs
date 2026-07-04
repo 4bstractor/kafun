@@ -49,7 +49,9 @@ defmodule Kafun.MixProject do
       {:phoenix_pubsub, "~> 2.1"},
       {:jason, "~> 1.4"},
       # Migration / outbound HTTP.
-      {:req, "~> 0.5"}
+      {:req, "~> 0.5"},
+      # LiveView test DOM parsing.
+      {:lazy_html, ">= 0.1.0", only: :test}
     ]
   end
 end

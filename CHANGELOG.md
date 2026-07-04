@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Admin UI upload: dropping more files than the batch cap left the
+  surplus stuck at 0% forever with no visible error (LiveView's
+  `:too_many_files` is config-level, and the template only rendered
+  per-entry errors). Surplus files are now auto-cancelled with a
+  visible "N file(s) skipped" notice, the cap is raised from a
+  hardcoded 50 to 500 and configurable via
+  `KAFUN_ADMIN_MAX_UPLOAD_FILES`, and config-level upload errors
+  render in the form. First LiveView test scaffolding landed with the
+  regression test (`test/admin_live_test.exs`).
+
 ## [0.3.0] — 2026-07-03
 
 `mix.exs` project version now tracks release tags (was frozen at 0.1.0).

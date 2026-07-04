@@ -160,6 +160,7 @@ Losing the master key means re-generating secrets, not losing data.
 | `KAFUN_GC_ABANDON_AFTER_SEC`            | `86400`                  | Multipart uploads older than this get aborted. |
 | `KAFUN_GC_BLOB_GRACE_SEC`               | `3600`                   | Orphan blobs / `.tmp.*` older than this get reaped. |
 | `KAFUN_ADMIN_MAX_UPLOAD_MB`             | `256`                    | Per-file cap on admin UI upload. |
+| `KAFUN_ADMIN_MAX_UPLOAD_FILES`          | `500`                    | Files-per-batch cap on admin UI upload; extras are skipped with a notice. |
 
 ## S3 surface
 
