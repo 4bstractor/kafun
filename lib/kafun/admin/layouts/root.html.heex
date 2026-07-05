@@ -98,6 +98,11 @@
                             font-size: 0.95rem; cursor: pointer; }
       .perms-public-label input[type="checkbox"] { margin-top: 0.25rem; }
       .key-full { color: #8b949e; font-size: 0.8rem; margin-left: 0.5rem; }
+      .dropzone-active { border-color: #58a6ff; background: #0d2440; }
+      .upload-report { margin: 0.75rem 0; }
+      .upload-report-progress { color: #8b949e; }
+      .upload-failed summary { cursor: pointer; color: #f85149; }
+      .upload-failed ul { margin: 0.4rem 0 0 1.25rem; color: #8b949e; }
       .pill-public { color: #58a6ff; border-color: #1f3a5b;
                      background: #0d2440; margin-left: 0.5rem; }
     </style>
@@ -105,8 +110,55 @@
     <script defer phx-track-static type="text/javascript" src={~p"/assets/phoenix_live_view.js"}></script>
     <script defer type="text/javascript">
       window.addEventListener("DOMContentLoaded", () => {
+        // Feeds arbitrarily large file selections to LiveView in waves of
+        // data-wave-size (the server's max_entries), so a 600-file drop
+        // uploads 50 at a time instead of stalling past the cap. The server
+        // pushes "upload-wave-done" when a wave drains.
+        const BatchedUpload = {
+          mounted() {
+            this.queue = []
+            this.waveSize = parseInt(this.el.dataset.waveSize || "50", 10)
+            this.picker = this.el.querySelector("#upload-picker")
+            this.lvInput = this.el.querySelector("input[data-phx-upload-ref]")
+
+            this.picker.addEventListener("change", e => {
+              e.stopPropagation()
+              this.start(Array.from(this.picker.files))
+              this.picker.value = ""
+            })
+            this.el.addEventListener("dragover", e => {
+              e.preventDefault()
+              this.el.classList.add("dropzone-active")
+            })
+            this.el.addEventListener("dragleave", () => this.el.classList.remove("dropzone-active"))
+            this.el.addEventListener("drop", e => {
+              e.preventDefault()
+              e.stopPropagation()
+              this.el.classList.remove("dropzone-active")
+              this.start(Array.from(e.dataTransfer.files))
+            })
+            this.handleEvent("upload-wave-done", () => this.feed())
+          },
+          start(files) {
+            if (files.length === 0) return
+            this.queue = files
+            this.pushEvent("upload-batch-start", {total: files.length})
+            this.feed()
+          },
+          feed() {
+            if (this.queue.length === 0) return
+            const wave = this.queue.splice(0, this.waveSize)
+            const dt = new DataTransfer()
+            wave.forEach(f => dt.items.add(f))
+            this.lvInput.files = dt.files
+            this.lvInput.dispatchEvent(new Event("input", {bubbles: true}))
+            this.lvInput.dispatchEvent(new Event("change", {bubbles: true}))
+          }
+        }
+
         let liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket, {
-          params: { _csrf_token: document.querySelector("meta[name='csrf-token']").content }
+          params: { _csrf_token: document.querySelector("meta[name='csrf-token']").content },
+          hooks: { BatchedUpload }
         })
         liveSocket.connect()
         window.liveSocket = liveSocket

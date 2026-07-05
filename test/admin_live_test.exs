@@ -101,5 +101,38 @@ defmodule KafunAdminLiveTest do
       {keys, _cps, _trunc, _next} = Index.list("upbucket", max_keys: 10)
       assert Enum.map(keys, & &1.key) == ["after.bin"]
     end
+
+    test "batched uploads: report accumulates across waves, wave-done is pushed, failures listed" do
+      {:ok, lv, _html} = live(build_conn(), "/buckets/upbucket")
+
+      # The hook announces the full selection before feeding wave 1.
+      lv |> element("#upload-dropzone") |> render_hook("upload-batch-start", %{"total" => 3})
+
+      assert render(lv) =~ "Uploading… 0 / 3"
+
+      # Wave 1 (one file per input — see the shared-socket note above).
+      input = file_input(lv, "#upload-form", :files, [%{name: "batch-1.bin", content: "one"}])
+      html = render_upload(input, "batch-1.bin")
+
+      # Report counts it, no per-file flash, and the hook is told to feed on.
+      assert html =~ "Uploading… 1 / 3"
+      refute html =~ "uploaded batch-1.bin"
+      assert_push_event(lv, "upload-wave-done", %{})
+
+      input = file_input(lv, "#upload-form", :files, [%{name: "batch-2.bin", content: "two"}])
+      assert render_upload(input, "batch-2.bin") =~ "Uploading… 2 / 3"
+
+      # Wave 3 collides with an existing key → recorded as skipped, batch
+      # completes with a summary instead of leaving the user to diff the bucket.
+      input = file_input(lv, "#upload-form", :files, [%{name: "batch-1.bin", content: "dupe"}])
+      html = render_upload(input, "batch-1.bin")
+
+      assert html =~ "uploaded 2 file(s), skipped 1"
+      assert html =~ "batch-1.bin"
+      assert html =~ "already exists"
+
+      {keys, _cps, _trunc, _next} = Index.list("upbucket", max_keys: 10)
+      assert Enum.map(keys, & &1.key) |> Enum.sort() == ["batch-1.bin", "batch-2.bin"]
+    end
   end
 end

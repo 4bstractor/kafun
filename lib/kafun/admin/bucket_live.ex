@@ -16,7 +16,7 @@ defmodule Kafun.Admin.BucketLive do
   def mount(%{"bucket" => bucket}, _session, socket) do
     if Index.bucket_exists?(bucket) do
       max_mb = Application.get_env(:kafun, :admin_max_upload_mb, 256)
-      max_files = Application.get_env(:kafun, :admin_max_upload_files, 500)
+      max_files = Application.get_env(:kafun, :admin_max_upload_files, 50)
 
       socket =
         socket
@@ -27,7 +27,8 @@ defmodule Kafun.Admin.BucketLive do
           notice: nil,
           page_size_label: @page_size,
           max_upload_mb: max_mb,
-          max_upload_files: max_files
+          max_upload_files: max_files,
+          upload_report: nil
         )
         |> allow_upload(:files,
           accept: :any,
@@ -72,27 +73,59 @@ defmodule Kafun.Admin.BucketLive do
     {:noreply, assign(socket, upload_prefix: p)}
   end
 
+  # The BatchedUpload hook announces the full selection size before feeding
+  # the first wave; from here on skips/conflicts accumulate in the report
+  # panel instead of flash churn.
+  def handle_event("upload-batch-start", %{"total" => total}, socket) when is_integer(total) do
+    {:noreply, assign(socket, upload_report: %{total: total, done: 0, failed: []}, notice: nil)}
+  end
+
   def handle_event("validate", _params, socket) do
     conf = socket.assigns.uploads.files
 
-    # :too_many_files is a *config-level* error keyed to the upload ref, not
-    # to any entry — the surplus entries never get upload tokens and would
-    # sit at 0% forever with no visible error. Cancel them and say why.
-    if :too_many_files in upload_errors(conf) do
-      surplus = Enum.drop(conf.entries, conf.max_entries)
+    # Two kinds of entry never make progress and would sit at 0% forever if
+    # left alone: entries with per-entry errors (too_large, not_accepted) in
+    # auto_upload mode, and the surplus beyond max_entries — those carry
+    # :too_many_files as a *config-level* error keyed to the upload ref, not
+    # to any entry, so they get no token and no visible error row. Cancel
+    # both kinds and record why.
+    errored =
+      for entry <- conf.entries, upload_errors(conf, entry) != [] do
+        {entry, conf |> upload_errors(entry) |> Enum.map_join(", ", &upload_error_text/1)}
+      end
 
-      socket =
-        Enum.reduce(surplus, socket, fn entry, s -> cancel_upload(s, :files, entry.ref) end)
+    surplus =
+      if :too_many_files in upload_errors(conf) do
+        skipped = Enum.drop(conf.entries, conf.max_entries) -- Enum.map(errored, &elem(&1, 0))
+        for entry <- skipped, do: {entry, "over the per-wave cap"}
+      else
+        []
+      end
 
-      {:noreply,
-       assign(socket,
-         notice:
-           {:error,
-            "#{length(surplus)} file(s) skipped — max #{conf.max_entries} per batch. " <>
-              "Re-drop the skipped files once this batch finishes."}
-       )}
-    else
-      {:noreply, socket}
+    case errored ++ surplus do
+      [] ->
+        {:noreply, socket}
+
+      cancels ->
+        socket =
+          Enum.reduce(cancels, socket, fn {entry, _}, s -> cancel_upload(s, :files, entry.ref) end)
+
+        socket =
+          case socket.assigns.upload_report do
+            nil ->
+              assign(socket,
+                notice:
+                  {:error,
+                   "#{length(cancels)} file(s) skipped — max #{conf.max_entries} per batch. " <>
+                     "Re-drop the skipped files once this batch finishes."}
+              )
+
+            report ->
+              failed = report.failed ++ Enum.map(cancels, fn {e, why} -> {e.client_name, why} end)
+              assign(socket, upload_report: %{report | failed: failed})
+          end
+
+        {:noreply, maybe_wave_done(socket)}
     end
   end
 
@@ -150,23 +183,71 @@ defmodule Kafun.Admin.BucketLive do
           {:ok, import_one(socket, entry, tmp)}
         end)
 
-      {notice, reload?} =
-        case result do
-          {:ok, key, _size} ->
-            {{:info, "uploaded #{key}"}, true}
-
-          {:conflict, key} ->
-            {{:error, "#{key} already exists — delete or rename first"}, false}
-
-          {:invalid, key} ->
-            {{:error, "invalid key #{inspect(key)} — keys can't start with /, contain control bytes, or use ./.. segments"}, false}
+      socket =
+        case socket.assigns.upload_report do
+          # No batch announced (JS hook absent) — legacy per-file flash.
+          nil -> flash_result(socket, result)
+          report -> assign(socket, upload_report: record_result(report, result))
         end
 
-      socket = assign(socket, notice: notice)
-      socket = if reload?, do: load_page(socket, socket.assigns.prefix), else: socket
-      {:noreply, socket}
+      # consume_uploaded_entry drops the entry from the channel state only
+      # after this callback returns, so exclude it from the drain check here.
+      {:noreply, maybe_wave_done(socket, entry.ref)}
     else
       {:noreply, socket}
+    end
+  end
+
+  defp flash_result(socket, result) do
+    notice =
+      case result do
+        {:ok, key, _size} ->
+          {:info, "uploaded #{key}"}
+
+        {:conflict, key} ->
+          {:error, "#{key} already exists — delete or rename first"}
+
+        {:invalid, key} ->
+          {:error, "invalid key #{inspect(key)} — keys can't start with /, contain control bytes, or use ./.. segments"}
+      end
+
+    assign(socket, notice: notice)
+  end
+
+  defp record_result(report, result) do
+    case result do
+      {:ok, _key, _size} -> %{report | done: report.done + 1}
+      {:conflict, key} -> %{report | failed: report.failed ++ [{key, "already exists"}]}
+      {:invalid, key} -> %{report | failed: report.failed ++ [{key, "invalid key"}]}
+    end
+  end
+
+  # A wave is drained when no entries are pending. Refresh the listing,
+  # finish the report if the whole batch is accounted for, and tell the
+  # BatchedUpload hook to feed the next wave.
+  defp maybe_wave_done(socket, consumed_ref \\ nil) do
+    if Enum.all?(socket.assigns.uploads.files.entries, &(&1.ref == consumed_ref)) do
+      socket = load_page(socket, socket.assigns.prefix)
+
+      socket =
+        case socket.assigns.upload_report do
+          %{total: total, done: done, failed: failed} when done + length(failed) >= total ->
+            notice =
+              if failed == [] do
+                {:info, "uploaded #{done} file(s)"}
+              else
+                {:error, "uploaded #{done} file(s), skipped #{length(failed)} — details below"}
+              end
+
+            assign(socket, notice: notice)
+
+          _ ->
+            socket
+        end
+
+      push_event(socket, "upload-wave-done", %{})
+    else
+      socket
     end
   end
 
@@ -289,15 +370,40 @@ defmodule Kafun.Admin.BucketLive do
                phx-debounce="200" />
       </div>
 
-      <label class="dropzone" phx-drop-target={@uploads.files.ref}>
+      <label id="upload-dropzone" class="dropzone" phx-hook="BatchedUpload"
+             data-wave-size={@max_upload_files}>
         <div class="dropzone-headline">Drop files here, or click to choose.</div>
         <div class="dropzone-sub">
-          Max {@max_upload_mb} MiB per file, {@max_upload_files} files per batch.
+          Any number of files, uploaded {@max_upload_files} at a time; max {@max_upload_mb} MiB per file.
           Filename becomes the key, prepended with the prefix above.
-          Conflicts on existing keys are refused — delete the old object first to replace it.
+          Conflicts on existing keys are skipped and listed — delete the old object first to replace it.
         </div>
-        <.live_file_input upload={@uploads.files} />
+        <input type="file" id="upload-picker" multiple phx-update="ignore" />
+        <.live_file_input upload={@uploads.files} style="display: none;" />
       </label>
+
+      <%= if @upload_report do %>
+        <div class="upload-report">
+          <%= if @upload_report.done + length(@upload_report.failed) < @upload_report.total do %>
+            <div class="upload-report-progress">
+              Uploading… {@upload_report.done + length(@upload_report.failed)} / {@upload_report.total}
+              <%= if @upload_report.failed != [] do %>
+                ({length(@upload_report.failed)} skipped so far)
+              <% end %>
+            </div>
+          <% end %>
+          <%= if @upload_report.failed != [] do %>
+            <details class="upload-failed" open={@upload_report.done + length(@upload_report.failed) >= @upload_report.total}>
+              <summary>{length(@upload_report.failed)} skipped file(s)</summary>
+              <ul>
+                <%= for {name, reason} <- @upload_report.failed do %>
+                  <li><code>{name}</code> — {reason}</li>
+                <% end %>
+              </ul>
+            </details>
+          <% end %>
+        </div>
+      <% end %>
 
       <%= for err <- upload_errors(@uploads.files) do %>
         <div class="upload-err">{upload_error_text(err)}</div>

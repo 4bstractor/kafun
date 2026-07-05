@@ -63,7 +63,7 @@ For prod deployment see `DEPLOY.md`. The release build is `MIX_ENV=prod mix rele
 | `KAFUN_ADMIN_ALLOWED_ORIGINS` | *(empty = no check)*   | Comma-separated CORS origins for the LiveView websocket. Empty disables origin checking — appropriate for trusted LAN behind NPM. Set explicitly to lock down (e.g. `https://kafun.harvelab.com,http://yomi:8334`). |
 | `KAFUN_PUBLIC_S3_URL`         | *(empty = falls back to KAFUN_HOST:KAFUN_PORT)* | Externally reachable URL of the S3 surface. The admin's image-preview `<img src=…>` uses this base so the browser can fetch images from a different machine than the admin UI. |
 | `KAFUN_ADMIN_MAX_UPLOAD_MB`   | `256`                  | Per-file cap for the admin UI drag-and-drop upload. Browser-side rejects files larger than this. |
-| `KAFUN_ADMIN_MAX_UPLOAD_FILES` | `500`                 | Files-per-batch cap for the same upload (LiveView `max_entries`). Surplus files are auto-cancelled with a notice in the `validate` handler — LV's `:too_many_files` is a config-level error invisible on entry rows, so without the cancel they'd sit at 0% forever. |
+| `KAFUN_ADMIN_MAX_UPLOAD_FILES` | `50`                  | Per-wave size for the admin upload (LiveView `max_entries`). The `BatchedUpload` JS hook (root layout) queues any size of selection client-side and feeds it in waves of this many; the server pushes `upload-wave-done` when a wave drains, and skipped files (conflict/invalid/too-large/over-cap) accumulate in the `upload_report` assign rendered as a skipped-files list. The `validate` handler still auto-cancels errored + surplus entries — LV's `:too_many_files` is a config-level error invisible on entry rows, so without the cancel they'd sit at 0% forever (the no-JS safety net). |
 
 ## Architecture notes
 
