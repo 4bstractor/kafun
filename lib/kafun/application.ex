@@ -47,10 +47,19 @@ defmodule Kafun.Application do
 
   # When KAFUN_MASTER_KEY is set, sweep any plaintext secrets into the
   # encrypted-at-rest format. Idempotent; no-op when the vault is disabled.
+  # Always log vault status when enabled — keys created post-vault encrypt
+  # silently, so without this line a healthy vault boot looks like nothing
+  # happened (empty env-bootstrap secrets are deliberately never encrypted).
   defp encrypt_secrets_at_rest do
-    case Kafun.Index.encrypt_plaintext_secrets() do
-      0 -> :ok
-      n -> Logger.info("kafun vault: encrypted #{n} plaintext access-key secret(s) at rest")
+    if Kafun.Vault.enabled?() do
+      case Kafun.Index.encrypt_plaintext_secrets() do
+        0 -> :ok
+        n -> Logger.info("kafun vault: encrypted #{n} plaintext access-key secret(s) at rest")
+      end
+
+      Logger.info("kafun vault: enabled — access-key secrets are encrypted at rest")
+    else
+      :ok
     end
   end
 

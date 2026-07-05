@@ -123,10 +123,14 @@ defmodule KafunAdminLiveTest do
       assert render_upload(input, "batch-2.bin") =~ "Uploading… 2 / 3"
 
       # Wave 3 collides with an existing key → recorded as skipped, batch
-      # completes with a summary instead of leaving the user to diff the bucket.
+      # completes with a summary instead of leaving the user to diff the
+      # bucket. The final notice lands via the :finish_wave message (it
+      # waits out the deferred entry drops), so re-render after the push.
       input = file_input(lv, "#upload-form", :files, [%{name: "batch-1.bin", content: "dupe"}])
-      html = render_upload(input, "batch-1.bin")
+      render_upload(input, "batch-1.bin")
+      assert_push_event(lv, "upload-wave-done", %{}, 1000)
 
+      html = render(lv)
       assert html =~ "uploaded 2 file(s), skipped 1"
       assert html =~ "batch-1.bin"
       assert html =~ "already exists"

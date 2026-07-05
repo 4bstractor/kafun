@@ -148,6 +148,9 @@
           feed() {
             if (this.queue.length === 0) return
             const wave = this.queue.splice(0, this.waveSize)
+            // Announce the wave size first — the server counts consumes and
+            // cancels down from it to know when to ask for the next wave.
+            this.pushEvent("upload-wave", {size: wave.length})
             const dt = new DataTransfer()
             wave.forEach(f => dt.items.add(f))
             this.lvInput.files = dt.files

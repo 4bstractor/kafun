@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-07-05
+
+### Fixed
+
+- Batched uploads (v0.4.0) raced LiveView's deferred entry cleanup:
+  consumed entries leave `uploads.files.entries` via messages from their
+  upload-channel processes, so the next wave could register while
+  leftovers lingered — overflowing `max_entries` and skipping a valid
+  file as "over the per-wave cap" (or stalling the batch entirely when
+  waves completed quickly). Wave completion is now counted down from a
+  hook-announced wave size, and `upload-wave-done` is only pushed after
+  the drops have landed, so a wave can never overflow the next one.
+  Also hardened cancels against dead upload-channel pids (would crash
+  the LiveView and silently reset mid-batch) and added a stalled-entry
+  sweep so a wedged file can't hang a batch. Verified with a real
+  browser driving 143-file drops (fresh + all-conflict reruns).
+- Boot now always logs vault status when `KAFUN_MASTER_KEY` is set —
+  previously the log line only appeared if plaintext rows were swept,
+  so a fresh vault-enabled boot looked like nothing happened.
+
 ## [0.4.0] — 2026-07-05
 
 ### Added
@@ -163,7 +183,8 @@ First tagged cut. Production-deployed on yomi since 2026-05-03.
 - Backup story still the docker-exec `Kafun.Backup.run/0` path; ZFS
   snapshot rework deferred.
 
-[Unreleased]: https://github.com/4bstractor/kafun/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/4bstractor/kafun/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/4bstractor/kafun/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/4bstractor/kafun/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/4bstractor/kafun/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/4bstractor/kafun/compare/v0.2.2...v0.3.0

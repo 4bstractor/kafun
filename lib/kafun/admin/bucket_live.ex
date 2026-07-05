@@ -28,7 +28,8 @@ defmodule Kafun.Admin.BucketLive do
           page_size_label: @page_size,
           max_upload_mb: max_mb,
           max_upload_files: max_files,
-          upload_report: nil
+          upload_report: nil,
+          wave_pending: nil
         )
         |> allow_upload(:files,
           accept: :any,
@@ -77,7 +78,21 @@ defmodule Kafun.Admin.BucketLive do
   # the first wave; from here on skips/conflicts accumulate in the report
   # panel instead of flash churn.
   def handle_event("upload-batch-start", %{"total" => total}, socket) when is_integer(total) do
-    {:noreply, assign(socket, upload_report: %{total: total, done: 0, failed: []}, notice: nil)}
+    {:noreply,
+     assign(socket,
+       upload_report: %{total: total, done: 0, failed: []},
+       wave_pending: nil,
+       notice: nil
+     )}
+  end
+
+  # The hook announces each wave's size right before dispatching it. Wave
+  # completion is detected by counting consumes/cancels down from this —
+  # NOT by inspecting uploads.files.entries, whose consumed entries are
+  # dropped via deferred channel messages and can linger there well past
+  # their consume when many entries finish quickly.
+  def handle_event("upload-wave", %{"size" => size}, socket) when is_integer(size) and size > 0 do
+    {:noreply, assign(socket, wave_pending: size)}
   end
 
   def handle_event("validate", _params, socket) do
@@ -108,7 +123,7 @@ defmodule Kafun.Admin.BucketLive do
 
       cancels ->
         socket =
-          Enum.reduce(cancels, socket, fn {entry, _}, s -> cancel_upload(s, :files, entry.ref) end)
+          Enum.reduce(cancels, socket, fn {entry, _}, s -> safe_cancel(s, entry.ref) end)
 
         socket =
           case socket.assigns.upload_report do
@@ -125,12 +140,14 @@ defmodule Kafun.Admin.BucketLive do
               assign(socket, upload_report: %{report | failed: failed})
           end
 
-        {:noreply, maybe_wave_done(socket)}
+        {:noreply, socket |> dec_wave(length(cancels)) |> maybe_wave_done()}
     end
   end
 
   def handle_event("cancel-upload", %{"ref" => ref}, socket) do
-    {:noreply, cancel_upload(socket, :files, ref)}
+    # Manual ✕ counts against the wave too, so cancelling a stuck row can
+    # never wedge the batch.
+    {:noreply, socket |> safe_cancel(ref) |> dec_wave(1) |> maybe_wave_done()}
   end
 
   ## Permissions panel
@@ -174,6 +191,53 @@ defmodule Kafun.Admin.BucketLive do
      |> assign(notice: {:info, "revoked grant for #{mask_id(key_id)}"})}
   end
 
+  @impl true
+  def handle_info(:finish_wave, socket) do
+    conf = socket.assigns.uploads.files
+    {consumed_pending, stuck} = Enum.split_with(conf.entries, & &1.done?)
+
+    # A non-done entry with the wave count at zero is a true zombie (its
+    # channel died without completing or erroring) — cancel and record it.
+    socket =
+      Enum.reduce(stuck, socket, fn entry, s ->
+        s = safe_cancel(s, entry.ref)
+
+        case s.assigns.upload_report do
+          nil ->
+            s
+
+          report ->
+            assign(s,
+              upload_report: %{report | failed: report.failed ++ [{entry.client_name, "upload stalled"}]}
+            )
+        end
+      end)
+
+    if consumed_pending == [] do
+      {:noreply, finish_wave(socket)}
+    else
+      # Consumed entries are removed from entries by messages coming from
+      # their upload-channel processes — cross-process, so they can arrive
+      # after this one. Never cancel them (their channel pid is already
+      # dead — cancel_entry would crash the LV) and never invite the next
+      # wave while they linger, or its registration overflows max_entries.
+      # Re-check shortly; the drops are already in flight.
+      Process.send_after(self(), :finish_wave, 25)
+      {:noreply, socket}
+    end
+  end
+
+  # cancel_upload GenServer.calls the entry's upload channel; for entries
+  # whose channel already exited that call would crash the LiveView. Treat
+  # "already gone" as cancelled.
+  defp safe_cancel(socket, ref) do
+    try do
+      cancel_upload(socket, :files, ref)
+    catch
+      :exit, _ -> socket
+    end
+  end
+
   ## Phoenix LiveView upload progress callback. Fires on every progress
   ## tick; `entry.done?` is the signal to consume + import.
   defp handle_progress(:files, entry, socket) do
@@ -190,11 +254,31 @@ defmodule Kafun.Admin.BucketLive do
           report -> assign(socket, upload_report: record_result(report, result))
         end
 
-      # consume_uploaded_entry drops the entry from the channel state only
-      # after this callback returns, so exclude it from the drain check here.
-      {:noreply, maybe_wave_done(socket, entry.ref)}
+      {:noreply, socket |> dec_wave(1) |> maybe_wave_done(entry.ref)}
     else
-      {:noreply, socket}
+      # Belt for entries that error mid-upload (chunk failure etc.) — they
+      # never reach done? and would wedge the wave count.
+      case upload_errors(socket.assigns.uploads.files, entry) do
+        [] ->
+          {:noreply, socket}
+
+        errs ->
+          reason = Enum.map_join(errs, ", ", &upload_error_text/1)
+          socket = safe_cancel(socket, entry.ref)
+
+          socket =
+            case socket.assigns.upload_report do
+              nil ->
+                assign(socket, notice: {:error, "#{entry.client_name}: #{reason}"})
+
+              report ->
+                assign(socket,
+                  upload_report: %{report | failed: report.failed ++ [{entry.client_name, reason}]}
+                )
+            end
+
+          {:noreply, socket |> dec_wave(1) |> maybe_wave_done()}
+      end
     end
   end
 
@@ -222,33 +306,62 @@ defmodule Kafun.Admin.BucketLive do
     end
   end
 
-  # A wave is drained when no entries are pending. Refresh the listing,
-  # finish the report if the whole batch is accounted for, and tell the
-  # BatchedUpload hook to feed the next wave.
+  defp dec_wave(socket, n) do
+    case socket.assigns.wave_pending do
+      nil -> socket
+      pending -> assign(socket, wave_pending: max(pending - n, 0))
+    end
+  end
+
+  # A wave is drained when its announced count is fully consumed/cancelled
+  # (hook flow), or — legacy no-hook flow — when no entries are pending.
   defp maybe_wave_done(socket, consumed_ref \\ nil) do
-    if Enum.all?(socket.assigns.uploads.files.entries, &(&1.ref == consumed_ref)) do
-      socket = load_page(socket, socket.assigns.prefix)
-
-      socket =
-        case socket.assigns.upload_report do
-          %{total: total, done: done, failed: failed} when done + length(failed) >= total ->
-            notice =
-              if failed == [] do
-                {:info, "uploaded #{done} file(s)"}
-              else
-                {:error, "uploaded #{done} file(s), skipped #{length(failed)} — details below"}
-              end
-
-            assign(socket, notice: notice)
-
-          _ ->
-            socket
+    case socket.assigns.wave_pending do
+      nil ->
+        # No wave announced (no-JS / test drops). consume_uploaded_entry
+        # drops its entry only after the callback returns, so exclude it.
+        if Enum.all?(socket.assigns.uploads.files.entries, &(&1.ref == consumed_ref)) do
+          finish_wave(socket)
+        else
+          socket
         end
 
-      push_event(socket, "upload-wave-done", %{})
-    else
-      socket
+      0 ->
+        # Every announced file is consumed or cancelled — but consumed
+        # entries leave uploads.files.entries via *deferred* self-sent
+        # channel messages that may still sit in the mailbox (progress
+        # messages from N concurrent upload channels queue ahead of them).
+        # Self-sending :finish_wave here enqueues it AFTER those drops, so
+        # when it processes the entries list is provably clean and the
+        # client can feed the next wave without tripping max_entries.
+        send(self(), :finish_wave)
+        assign(socket, wave_pending: nil)
+
+      _ ->
+        socket
     end
+  end
+
+  defp finish_wave(socket) do
+    socket = load_page(socket, socket.assigns.prefix)
+
+    socket =
+      case socket.assigns.upload_report do
+        %{total: total, done: done, failed: failed} when done + length(failed) >= total ->
+          notice =
+            if failed == [] do
+              {:info, "uploaded #{done} file(s)"}
+            else
+              {:error, "uploaded #{done} file(s), skipped #{length(failed)} — details below"}
+            end
+
+          assign(socket, notice: notice)
+
+        _ ->
+          socket
+      end
+
+    push_event(socket, "upload-wave-done", %{})
   end
 
   defp import_one(socket, entry, tmp_path) do

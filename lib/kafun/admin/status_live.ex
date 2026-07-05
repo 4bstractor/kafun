@@ -144,6 +144,20 @@ defmodule Kafun.Admin.StatusLive do
       <div class={"flash flash-#{elem(@notice, 0)}"}>{elem(@notice, 1)}</div>
     <% end %>
 
+    <h2>Secrets at rest</h2>
+    <dl class="meta-grid">
+      <dt>Vault</dt>
+      <dd>
+        <%= if Kafun.Vault.enabled?() do %>
+          <span class="pill pill-public">enabled</span>
+          — access-key secrets are AES-256-GCM encrypted in the index (KAFUN_MASTER_KEY set)
+        <% else %>
+          <span class="pill">disabled</span>
+          — secrets stored in plaintext; set KAFUN_MASTER_KEY to encrypt at rest
+        <% end %>
+      </dd>
+    </dl>
+
     <h2>Garbage collection</h2>
     <dl class="meta-grid">
       <dt>Interval</dt>
