@@ -249,14 +249,19 @@ defmodule Kafun.Admin.KeysLive do
               </td>
               <td>
                 <%= if key.status == :active do %>
-                  <button class="btn btn-link" phx-click="toggle_admin_ui" phx-value-id={key.id}
-                          title={if key.admin_ui,
-                            do: "This key can log in to the admin UI (Basic auth: key id / secret). Click to disable.",
-                            else: "Allow this key to log in to the admin UI. Requires a real (non-empty) secret."}
-                          data-confirm={unless key.admin_ui,
-                            do: "Allow #{mask_id(key.id)} to authenticate to the admin UI? Once any key has admin UI access, the UI requires login even if KAFUN_ADMIN_PASSWORD is unset."}>
-                    {if key.admin_ui, do: "✓ enabled", else: "—"}
-                  </button>
+                  <%= if key.admin_ui do %>
+                    <button class="btn btn-primary" phx-click="toggle_admin_ui" phx-value-id={key.id}
+                            title="This key logs in to the admin UI (Basic auth: key id / secret). Click to disable."
+                            data-confirm={"Remove admin UI access for #{mask_id(key.id)}? If it's the last enabled key and no KAFUN_ADMIN_PASSWORD is set, the UI goes back to open access."}>
+                      ✓ Enabled
+                    </button>
+                  <% else %>
+                    <button class="btn" phx-click="toggle_admin_ui" phx-value-id={key.id}
+                            title="Allow this key to log in to the admin UI. Requires a real (non-empty) secret."
+                            data-confirm={"Allow #{mask_id(key.id)} to authenticate to the admin UI? Once any key has admin UI access, the UI requires login even if KAFUN_ADMIN_PASSWORD is unset."}>
+                      Enable login
+                    </button>
+                  <% end %>
                 <% else %>
                   —
                 <% end %>
