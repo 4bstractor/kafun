@@ -176,21 +176,19 @@ Done: ListAllMyBuckets, CreateBucket, HeadBucket, DeleteBucket, ListObjectsV2 (d
 
 ## Roadmap
 
-Mostly chasing public release at this point. The S3 surface and the admin UI cover all daily homelab flows. Open work, grouped:
+Status as of v0.4.2 (2026-07-05): the original roadmap is done and live-verified on yomi. Public release Phase 1 shipped (v0.2.1–v0.2.2), the pre-publish polish branch merged and deployed (v0.3.0: Vault encryption at rest + admin-UI auth via access keys, both verified in prod), and the admin upload path grew unbounded batched uploads with a skipped-files report (v0.3.1–v0.4.2). Everything below is forward-looking. Near-term ops follow-ups are tracked as tame tasks (`project:kafun`); session history in tame entry 277.
 
-**Public release (Phase 1):** mostly done as of 2026-07-03 — LICENSE (Apache 2.0) ✓, README rewrite ✓, `ghcr.io/4bstractor/kafun` published on `v*` tags via the dual-workflow split ✓ (first public image: 0.2.1), CI on both hosts ✓, CHANGELOG + semver ✓, `COMPARISON.md` (vs Garage/SeaweedFS/archived-MinIO) ✓, backup story incl. non-ZFS hosts (DEPLOY.md §4) ✓, README screenshots (`docs/screenshots/`, regenerate via `priv/dev/seed_demo.exs` + headless firefox) ✓. **Phase 1 complete.** (Historical card #54.)
+**Near-term (tame tasks):**
+- Rotate imouto's env-bootstrapped key (`KAFUN_KEYS`) to a real secret via the admin UI — the last empty-secret key in prod. Once done, sunset the `:empty_secret` SigV4 bypass in `Auth`/`SigV4.verify` (delete the branch, require real secrets everywhere).
+- Backup deployment on yomi: prep a sibling ZFS pool as replication target, deploy sanoid (+ syncoid send/recv) per DEPLOY.md §4. Docs are ahead of the deployment.
 
-**Pre-publish polish branch (in review):** encryption at rest for `access_keys.secret` (`Kafun.Vault`) and admin-UI auth via access keys (per-key `admin_ui` flag) both landed on `pre_publish_polish`. (Historical card #56.)
+**Tier-2 S3 wire polish (parked):** `x-amz-bucket-region` on HeadBucket, multi-range GET → `multipart/byteranges`, list-buckets pagination, object-level tagging stubs, POST-form upload, strict multi-etag `If-Match` semantics, migrator single-shot PUT 4 GiB cap. Revisit if a client surprises us. (Historical card #46.)
 
-**Tier-2 S3 wire polish:** `x-amz-bucket-region` on HeadBucket, multi-range GET → `multipart/byteranges`, list-buckets pagination, object-level tagging stubs, POST-form upload. Card #46. Revisit if a client surprises us.
-
-**Admin UI polish (cards #50–52):**
+**Admin UI polish (parked; historical cards #50–52):**
 - Visual: loading states, sidebar nav, mobile collapse, empty-state illustrations.
-- Functional gaps: pagination on bucket browser (currently capped at 100/prefix), bulk select + delete, sortable columns, search-keys-within-a-bucket, folder rename / prefix move.
+- Functional gaps: pagination on bucket browser (currently capped at 100/prefix), bulk select + delete, sortable columns, search-keys-within-a-bucket, folder rename / prefix move. (Batched drag-and-drop upload + skip reporting: done in v0.4.x.)
 - Image-aware: grid view for image-heavy buckets, lightbox with arrow-key nav, side-by-side compare, EXIF in object detail, derived-thumbnail caching.
 
 **Smaller follow-ups:**
-- LiveView test scaffolding — seeded in `test/admin_live_test.exs` (endpoint with `server: false`, per-test Index + root, `lazy_html` test dep). BucketLive uploads covered; KeysLive/ObjectLive LV tests still to be written on that pattern.
-- ~~`Kafun.Auth` legacy surface cleanup~~ — removed on the pre_publish_polish branch.
-- The `:empty_secret` bypass should sunset once env-bootstrapped keys have all rotated to real secrets.
+- LiveView test coverage — scaffolding seeded in `test/admin_live_test.exs` (endpoint with `server: false`, per-test Index + root, `lazy_html` test dep). BucketLive uploads covered; KeysLive/ObjectLive LV tests still to be written on that pattern. Browser-level upload testing: `priv/dev/upload_repro.js` (playwright-firefox).
 - Bare-metal `rel/openrc/` and `rel/systemd/` siblings if shipping to non-Void targets.
